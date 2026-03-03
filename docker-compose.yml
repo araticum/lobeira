@@ -1,0 +1,12 @@
+services:
+  parser:
+    build: .
+    ports:
+      - "7000:7000"
+    volumes:
+      - ./storage:/app/storage
+    environment:
+      - ENABLE_EASYOCR=false
+      - MAX_WORKERS=2
+      - LOG_LEVEL=INFO
+    restart: unless-stopped
