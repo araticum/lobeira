@@ -26,7 +26,7 @@ RUN pip install --no-cache-dir -r requirements-core.txt
 COPY requirements-heavy.txt .
 RUN pip install --no-cache-dir -r requirements-heavy.txt || echo "WARNING: heavy deps failed, continuing without them"
 # Install torch with ROCm support (AMD Radeon) instead of default CUDA
-RUN pip install --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/rocm6.3
+RUN pip install --no-cache-dir "torch==2.7.0+rocm6.3" "torchvision==0.22.0+rocm6.3" --index-url https://download.pytorch.org/whl/rocm6.3
 
 
 # Opt-in EasyOCR (heavy, GPU-optional)
