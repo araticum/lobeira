@@ -4,6 +4,7 @@ API REST FastAPI — roda em container isolado na porta 7000.
 """
 
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -72,7 +73,18 @@ class ParseRequest(BaseModel):
 class DownloadRequest(BaseModel):
     tender_id: str
     documents: List[DocumentInput]
-    monstro_callback_url: str
+
+
+class DownloadedFile(BaseModel):
+    filename: str
+    content_b64: str
+    mime_type: str
+
+
+class DownloadResponse(BaseModel):
+    status: str
+    files: List[DownloadedFile]
+    errors: List[str]
 
 
 class DocumentResult(BaseModel):
@@ -248,13 +260,13 @@ async def parse_documents(req: ParseRequest, background_tasks: BackgroundTasks):
     )
 
 
-@app.post("/download")
+@app.post("/download", response_model=DownloadResponse)
 async def download_documents(req: DownloadRequest):
     tender_root = STORAGE_ROOT / req.tender_id
     raw_dir = tender_root / "raw"
     raw_dir.mkdir(parents=True, exist_ok=True)
 
-    files_sent = 0
+    files: List[DownloadedFile] = []
     errors: List[str] = []
 
     async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
@@ -294,16 +306,18 @@ async def download_documents(req: DownloadRequest):
             for fpath in files_to_send:
                 try:
                     file_bytes = fpath.read_bytes()
-                    cb_resp = await client.post(
-                        req.monstro_callback_url,
-                        files={"file": (fpath.name, file_bytes, "application/octet-stream")},
+                    mime_type = magic.from_buffer(file_bytes, mime=True) or "application/octet-stream"
+                    files.append(
+                        DownloadedFile(
+                            filename=fpath.name,
+                            content_b64=base64.b64encode(file_bytes).decode("ascii"),
+                            mime_type=mime_type,
+                        )
                     )
-                    cb_resp.raise_for_status()
-                    files_sent += 1
                 except Exception as exc:
-                    errors.append(f"Falha callback {fpath.name}: {exc}")
+                    errors.append(f"Falha ao preparar arquivo {fpath.name}: {exc}")
 
-    return {"status": "ok", "files_sent": files_sent, "errors": errors}
+    return DownloadResponse(status="ok", files=files, errors=errors)
 
 
 # ---------------------------------------------------------------------------
