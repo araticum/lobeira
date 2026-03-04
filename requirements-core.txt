@@ -1,0 +1,16 @@
+fastapi
+uvicorn[standard]
+pdfplumber
+pymupdf
+pdfminer.six
+python-docx
+python-magic
+pytesseract
+Pillow
+beautifulsoup4
+lxml
+pypdf
+pikepdf
+rarfile
+py7zr
+httpx

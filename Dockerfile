@@ -18,8 +18,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends --fix-missing \
 WORKDIR /app
 
 # Install Python dependencies
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Core deps (obrigatório)
+COPY requirements-core.txt .
+RUN pip install --no-cache-dir -r requirements-core.txt
+
+# Heavy deps: docling, marker-pdf (opcional — falha não quebra container)
+COPY requirements-heavy.txt .
+RUN pip install --no-cache-dir -r requirements-heavy.txt || echo "WARNING: heavy deps failed, continuing without them"
 
 # Opt-in EasyOCR (heavy, GPU-optional)
 ARG ENABLE_EASYOCR=false
