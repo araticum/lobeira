@@ -12,7 +12,6 @@ import re
 import time
 import unicodedata
 import uuid
-import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -21,6 +20,8 @@ import httpx
 import magic
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 from pydantic import BaseModel
+
+from zip_recursive import ZipExtractionLimits, extract_zip_recursive, write_extracted_files
 
 # ---------------------------------------------------------------------------
 # Config
@@ -401,9 +402,25 @@ async def _handle_document(doc: DocumentInput, tmpdir: Path, use_easyocr: bool, 
 def _extract_zip(path: Path, dest: Path) -> List[Path]:
     out = dest / f"_zip_{path.stem}"
     out.mkdir(exist_ok=True)
-    with zipfile.ZipFile(path) as zf:
-        zf.extractall(out)
-    return [p for p in out.rglob("*") if p.is_file()]
+
+    limits = ZipExtractionLimits()
+    extraction = extract_zip_recursive(
+        archive_name=path.name,
+        archive_bytes=path.read_bytes(),
+        limits=limits,
+        logger=logger,
+        log_prefix=f"parser-zip:{path.name}",
+    )
+
+    extracted_paths = write_extracted_files(out, extraction.files, logger=logger)
+    if extraction.warnings:
+        logger.warning(
+            "[parser-zip:%s] extração parcial com avisos warnings=%s",
+            path.name,
+            len(extraction.warnings),
+        )
+
+    return extracted_paths
 
 
 def _extract_rar(path: Path, dest: Path) -> List[Path]:
