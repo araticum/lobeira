@@ -550,6 +550,7 @@ def _parse_pdf(path: Path, use_easyocr: bool, force_ocr: bool) -> Dict:
     1. PyMuPDF  — fast native extraction using embedded text
     2. Docling  — high-quality layout-aware engine
     3. Marker   — handles difficult/scanned PDFs → Markdown output
+    4. OCR      — tesseract/easyocr for fully scanned PDFs
     """
     filename = path.name
     text = ""
@@ -616,6 +617,21 @@ def _parse_pdf(path: Path, use_easyocr: bool, force_ocr: bool) -> Dict:
             logger.warning("marker não instalado — pulando etapa 3 do fallback para %s", filename)
         except Exception as e:
             logger.debug("marker falhou em %s: %s", filename, e)
+
+    # ── 4) OCR — fallback final para PDFs scaneados ───────────────────────────
+    if not text or native_is_weak:
+        try:
+            text_ocr, pages_ocr = _pdf_ocr_tesseract(path, use_easyocr)
+            ocr_text = _normalize_text(text_ocr)
+            if ocr_text:
+                ocr_quality = _quality_score(ocr_text, pages_ocr or max(1, pages))
+                if ocr_quality > quality:
+                    text = ocr_text
+                    pages = pages_ocr or pages
+                    quality = ocr_quality
+                    method = "ocr"
+        except Exception as e:
+            logger.debug("ocr falhou em %s: %s", filename, e)
 
     type_detected = "pdf_native" if method in ("pymupdf", "docling", "marker") else "pdf_scanned"
     return _make_result(filename, type_detected, method or "failed", pages, quality, text)
