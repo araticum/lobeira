@@ -12,6 +12,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends --fix-missing \
     unar \
     libreoffice-writer \
     libreoffice-calc \
+    libgl1 \
+    libglib2.0-0 \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
@@ -31,6 +33,9 @@ RUN pip install --no-cache-dir "torch==2.7.0+rocm6.3" "torchvision==0.22.0+rocm6
 
 # EasyOCR — usa o torch ROCm já instalado acima (não reinstala torch)
 RUN pip install --no-cache-dir easyocr
+
+# RapidOCR + onnxruntime — engine OCR leve para o docling (CPU, sem GPU necessária)
+RUN pip install --no-cache-dir onnxruntime rapidocr-onnxruntime
 
 COPY main.py .
 COPY zip_recursive.py .
