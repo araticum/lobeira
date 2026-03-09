@@ -601,32 +601,36 @@ def _parse_pdf(path: Path, use_easyocr: bool, force_ocr: bool) -> Dict:
 
     # ── 2) Docling — engine principal de qualidade ─────────────────────────────
     if not text or native_is_weak or force_ocr:
+        _docling_available = False
         try:
             from docling.document_converter import DocumentConverter  # type: ignore
-            converter = DocumentConverter()
-            result = converter.convert(str(path))
-            docling_text = result.document.export_to_text() if result and result.document else ""
-            docling_text = _normalize_text(docling_text)
-            if docling_text:
-                docling_pages = pages or 1
-                docling_quality = _quality_score(docling_text, docling_pages)
-                if force_ocr or docling_quality > quality or quality < REPROCESS_IF_SCORE_BELOW:
-                    text = docling_text
-                    pages = docling_pages
-                    quality = docling_quality
-                    method = "docling"
-                    native_is_weak = quality < FORCE_OCR_IF_SCORE_BELOW
-                    logs.append(f"docling: extraiu {len(text)} chars, {pages}p (score {quality:.2f})")
-                else:
-                    logs.append(f"docling: não melhorou resultado (score {docling_quality:.2f} vs {quality:.2f})")
-            else:
-                logs.append("docling: resultado vazio")
+            _docling_available = True
         except ImportError:
             logger.warning("docling não instalado — pulando etapa 2 do fallback para %s", filename)
             logs.append("docling: não instalado — pulado")
-        except Exception as e:
-            logger.debug("docling falhou em %s: %s", filename, e)
-            logs.append(f"docling: falhou ({e})")
+        if _docling_available:
+            try:
+                converter = DocumentConverter()
+                result = converter.convert(str(path))
+                docling_text = result.document.export_to_text() if result and result.document else ""
+                docling_text = _normalize_text(docling_text)
+                if docling_text:
+                    docling_pages = pages or 1
+                    docling_quality = _quality_score(docling_text, docling_pages)
+                    if force_ocr or docling_quality > quality or quality < REPROCESS_IF_SCORE_BELOW:
+                        text = docling_text
+                        pages = docling_pages
+                        quality = docling_quality
+                        method = "docling"
+                        native_is_weak = quality < FORCE_OCR_IF_SCORE_BELOW
+                        logs.append(f"docling: extraiu {len(text)} chars, {pages}p (score {quality:.2f})")
+                    else:
+                        logs.append(f"docling: não melhorou resultado (score {docling_quality:.2f} vs {quality:.2f})")
+                else:
+                    logs.append("docling: resultado vazio (sem OCR engine ou PDF scaneado)")
+            except Exception as e:
+                logger.warning("docling falhou em %s: %s", filename, e)
+                logs.append(f"docling: falhou ({e})")
 
     # ── 3) Marker — fallback para PDFs difíceis → Markdown ───────────────────
     if not text or native_is_weak:
@@ -677,7 +681,7 @@ def _parse_pdf(path: Path, use_easyocr: bool, force_ocr: bool) -> Dict:
             else:
                 logs.append("ocr: resultado vazio")
         except Exception as e:
-            logger.debug("ocr falhou em %s: %s", filename, e)
+            logger.warning("ocr falhou em %s: %s", filename, e)
             logs.append(f"ocr: falhou ({e})")
 
     type_detected = "pdf_native" if method in ("pymupdf", "docling", "marker") else "pdf_scanned"
