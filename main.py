@@ -613,21 +613,11 @@ def _parse_pdf(path: Path, use_easyocr: bool, force_ocr: bool) -> Dict:
         if _docling_available:
             try:
                 from docling.datamodel.base_models import InputFormat  # type: ignore
-                from docling.datamodel.pipeline_options import (  # type: ignore
-                    EasyOcrOptions,
-                    PdfPipelineOptions,
-                    TesseractOcrOptions,
-                )
+                from docling.datamodel.pipeline_options import PdfPipelineOptions  # type: ignore
                 from docling.document_converter import PdfFormatOption  # type: ignore
 
                 pipeline_options = PdfPipelineOptions()
-                pipeline_options.do_ocr = True
-                if use_easyocr:
-                    pipeline_options.ocr_options = EasyOcrOptions(lang=["pt", "en"])
-                    ocr_engine_label = "easyocr"
-                else:
-                    pipeline_options.ocr_options = TesseractOcrOptions(lang=["por", "eng"])
-                    ocr_engine_label = "tesseract"
+                pipeline_options.do_ocr = False  # Docling só faz layout — OCR é feito pelo EasyOCR no step 4
 
                 converter = DocumentConverter(
                     format_options={
@@ -647,15 +637,15 @@ def _parse_pdf(path: Path, use_easyocr: bool, force_ocr: bool) -> Dict:
                         method = "docling"
                         native_is_weak = quality < FORCE_OCR_IF_SCORE_BELOW
                         logs.append(
-                            f"docling ({ocr_engine_label}): extraiu {len(text)} chars, {pages}p (score {quality:.2f})"
+                            f"docling: extraiu {len(text)} chars, {pages}p (score {quality:.2f})"
                         )
                     else:
                         logs.append(
-                            f"docling ({ocr_engine_label}): não melhorou resultado"
+                            f"docling: não melhorou resultado"
                             f" (score {docling_quality:.2f} vs {quality:.2f})"
                         )
                 else:
-                    logs.append(f"docling ({ocr_engine_label}): resultado vazio (PDF scaneado sem texto extraível)")
+                    logs.append("docling: resultado vazio (PDF scaneado sem texto extraível)")
             except Exception as e:
                 logger.warning("docling falhou em %s: %s", filename, e)
                 logs.append(f"docling: falhou ({e})")
