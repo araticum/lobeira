@@ -6,7 +6,7 @@ services:
     volumes:
       - ./storage:/app/storage
     environment:
-      - ENABLE_EASYOCR=false
+      - ENABLE_EASYOCR=true
       - MAX_WORKERS=2
       - LOG_LEVEL=INFO
       - PARSER_MODE=precision_first
