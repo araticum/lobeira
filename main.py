@@ -248,6 +248,7 @@ async def parse_documents(req: ParseRequest, background_tasks: BackgroundTasks):
         "documents": [],
         "full_text": "",
         "errors": [],
+        "logs": [],
         "processing_time_s": 0.0,
         "created_at": time.time(),
         "storage_path": str(storage_path),
@@ -352,11 +353,22 @@ async def _process_job(job_id: str, req: ParseRequest):
         for r in doc_results:
             if r.get("text") and r.get("filename"):
                 (parsed_dir / (r["filename"] + ".txt")).write_text(r["text"], encoding="utf-8")
+
+        # Aggregate per-document logs into job-level logs
+        all_logs: List[str] = []
+        for r in doc_results:
+            fname = r.get("filename", "?")
+            for entry in r.get("logs", []):
+                all_logs.append(f"[{fname}] {entry}")
+        for err in errors:
+            all_logs.append(f"[erro] {err}")
+
         jobs[job_id].update(
             status="done" if doc_results else "error",
             documents=doc_results,
             full_text=full_text,
             errors=errors,
+            logs=all_logs,
             processing_time_s=round(time.time() - t0, 2),
             storage_path=str(target_dir),
         )
@@ -556,6 +568,7 @@ def _parse_pdf(path: Path, use_easyocr: bool, force_ocr: bool) -> Dict:
     text = ""
     method = ""
     pages = 0
+    logs: List[str] = []
 
     # ── 1) PyMuPDF — rápido, extração nativa ──────────────────────────────────
     try:
@@ -569,11 +582,22 @@ def _parse_pdf(path: Path, use_easyocr: bool, force_ocr: bool) -> Dict:
             method = "pymupdf"
     except Exception as e:
         logger.debug("pymupdf falhou em %s: %s", filename, e)
+        logs.append(f"pymupdf: falhou ({e})")
 
     text = _normalize_text(text)
     quality = _quality_score(text, pages)
     chars_per_page = (len(text) / max(1, pages)) if text else 0
     native_is_weak = quality < FORCE_OCR_IF_SCORE_BELOW or chars_per_page < MIN_CHARS_PER_PAGE_NATIVE
+
+    if method == "pymupdf":
+        if native_is_weak:
+            logs.append(
+                f"pymupdf: extraiu {len(text)} chars, {pages}p (score {quality:.2f} — fraco, tentando fallback)"
+            )
+        else:
+            logs.append(f"pymupdf: extraiu {len(text)} chars, {pages}p (score {quality:.2f})")
+    elif not logs:
+        logs.append(f"pymupdf: extraiu 0 chars (sem texto nativo)")
 
     # ── 2) Docling — engine principal de qualidade ─────────────────────────────
     if not text or native_is_weak or force_ocr:
@@ -592,10 +616,17 @@ def _parse_pdf(path: Path, use_easyocr: bool, force_ocr: bool) -> Dict:
                     quality = docling_quality
                     method = "docling"
                     native_is_weak = quality < FORCE_OCR_IF_SCORE_BELOW
+                    logs.append(f"docling: extraiu {len(text)} chars, {pages}p (score {quality:.2f})")
+                else:
+                    logs.append(f"docling: não melhorou resultado (score {docling_quality:.2f} vs {quality:.2f})")
+            else:
+                logs.append("docling: resultado vazio")
         except ImportError:
             logger.warning("docling não instalado — pulando etapa 2 do fallback para %s", filename)
+            logs.append("docling: não instalado — pulado")
         except Exception as e:
             logger.debug("docling falhou em %s: %s", filename, e)
+            logs.append(f"docling: falhou ({e})")
 
     # ── 3) Marker — fallback para PDFs difíceis → Markdown ───────────────────
     if not text or native_is_weak:
@@ -613,10 +644,17 @@ def _parse_pdf(path: Path, use_easyocr: bool, force_ocr: bool) -> Dict:
                     pages = marker_pages
                     quality = marker_quality
                     method = "marker"
+                    logs.append(f"marker: extraiu {len(text)} chars, {pages}p (score {quality:.2f})")
+                else:
+                    logs.append(f"marker: não melhorou resultado (score {marker_quality:.2f} vs {quality:.2f})")
+            else:
+                logs.append("marker: resultado vazio")
         except ImportError:
             logger.warning("marker não instalado — pulando etapa 3 do fallback para %s", filename)
+            logs.append("marker: não instalado — pulado")
         except Exception as e:
             logger.debug("marker falhou em %s: %s", filename, e)
+            logs.append(f"marker: falhou ({e})")
 
     # ── 4) OCR — fallback final para PDFs scaneados ───────────────────────────
     if not text or native_is_weak:
@@ -625,16 +663,25 @@ def _parse_pdf(path: Path, use_easyocr: bool, force_ocr: bool) -> Dict:
             ocr_text = _normalize_text(text_ocr)
             if ocr_text:
                 ocr_quality = _quality_score(ocr_text, pages_ocr or max(1, pages))
+                ocr_engine = "easyocr" if use_easyocr else "tesseract"
                 if ocr_quality > quality:
                     text = ocr_text
                     pages = pages_ocr or pages
                     quality = ocr_quality
                     method = "ocr"
+                    logs.append(
+                        f"ocr ({ocr_engine}): extraiu {len(text)} chars, {pages}p (score {quality:.2f})"
+                    )
+                else:
+                    logs.append(f"ocr ({ocr_engine}): não melhorou resultado (score {ocr_quality:.2f})")
+            else:
+                logs.append("ocr: resultado vazio")
         except Exception as e:
             logger.debug("ocr falhou em %s: %s", filename, e)
+            logs.append(f"ocr: falhou ({e})")
 
     type_detected = "pdf_native" if method in ("pymupdf", "docling", "marker") else "pdf_scanned"
-    return _make_result(filename, type_detected, method or "failed", pages, quality, text)
+    return _make_result(filename, type_detected, method or "failed", pages, quality, text, logs=logs)
 
 
 def _pdf_ocr_tesseract(path: Path, use_easyocr: bool) -> tuple:
@@ -754,7 +801,7 @@ def _quality_score(text: str, pages: int) -> float:
     return round(score, 2)
 
 
-def _make_result(filename, type_detected, method, pages, quality, text, error=None) -> Dict:
+def _make_result(filename, type_detected, method, pages, quality, text, error=None, logs=None) -> Dict:
     normalized_text = _normalize_text(text)
     quality = _quality_score(normalized_text, pages)
     return {
@@ -765,4 +812,5 @@ def _make_result(filename, type_detected, method, pages, quality, text, error=No
         "quality_score": quality,
         "text": normalized_text,
         "error": error,
+        "logs": logs or [],
     }
