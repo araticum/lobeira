@@ -96,6 +96,7 @@ class DocumentResult(BaseModel):
     quality_score: float
     text: str
     error: Optional[str] = None
+    logs: List[str] = []
 
 
 class ParseResponse(BaseModel):
@@ -105,6 +106,7 @@ class ParseResponse(BaseModel):
     documents: List[DocumentResult] = []
     full_text: str = ""
     errors: List[str] = []
+    logs: List[str] = []
     processing_time_s: float = 0.0
 
 
@@ -663,11 +665,10 @@ def _parse_pdf(path: Path, use_easyocr: bool, force_ocr: bool) -> Dict:
     # ── 4) OCR — fallback final para PDFs scaneados ───────────────────────────
     if not text or native_is_weak:
         try:
-            text_ocr, pages_ocr = _pdf_ocr_tesseract(path, use_easyocr)
+            text_ocr, pages_ocr, ocr_engine = _pdf_ocr_tesseract(path, use_easyocr)
             ocr_text = _normalize_text(text_ocr)
             if ocr_text:
                 ocr_quality = _quality_score(ocr_text, pages_ocr or max(1, pages))
-                ocr_engine = "easyocr" if use_easyocr else "tesseract"
                 if ocr_quality > quality:
                     text = ocr_text
                     pages = pages_ocr or pages
@@ -706,14 +707,21 @@ def _pdf_ocr_tesseract(path: Path, use_easyocr: bool) -> tuple:
             images.append(img)
         doc.close()
 
+    # Build easyocr reader once (not per page — model load is expensive)
+    easyocr_reader = None
+    if use_easyocr:
+        try:
+            import easyocr
+            import numpy as np
+            easyocr_reader = easyocr.Reader(["pt", "en"])
+        except Exception:
+            pass  # fallback to tesseract below
+
     parts = []
     for img in images:
-        if use_easyocr:
+        if easyocr_reader is not None:
             try:
-                import easyocr
-                reader = easyocr.Reader(["pt", "en"])
-                import numpy as np
-                result = reader.readtext(np.array(img))
+                result = easyocr_reader.readtext(np.array(img))
                 parts.append(" ".join(r[1] for r in result))
                 continue
             except Exception:
@@ -721,7 +729,8 @@ def _pdf_ocr_tesseract(path: Path, use_easyocr: bool) -> tuple:
         t = pytesseract.image_to_string(img, lang="por+eng")
         parts.append(t)
 
-    return "\n".join(parts).strip(), len(images)
+    engine_used = "easyocr" if easyocr_reader is not None else "tesseract"
+    return "\n".join(parts).strip(), len(images), engine_used
 
 
 def _parse_docx(path: Path) -> Dict:
