@@ -19,8 +19,8 @@ services:
       #   RX 6000 series (RDNA2, gfx1030): HSA_OVERRIDE_GFX_VERSION=10.3.0
       #   RX 7000 series (RDNA3, gfx1100): HSA_OVERRIDE_GFX_VERSION=11.0.0
       #   RX 9000 series (RDNA4, gfx1201): HSA_OVERRIDE_GFX_VERSION=12.0.1
-      # Descomente e ajuste conforme sua GPU:
-      # - HSA_OVERRIDE_GFX_VERSION=11.0.0
+      # GPU atual: AMD Radeon RX 7800 XT (RDNA3, gfx1100)
+      - HSA_OVERRIDE_GFX_VERSION=11.0.0
     # --- AMD ROCm GPU passthrough (Docker Desktop + WSL2) ---
     # No WSL2, o device de GPU é /dev/dxg (interface DirectX do Windows → WSL2).
     # /dev/kfd (Linux nativo) NÃO existe no WSL2 — não usar.
