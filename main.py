@@ -9,6 +9,8 @@ import json
 import logging
 import os
 import re
+import sqlite3
+import threading
 import time
 import unicodedata
 import uuid
@@ -31,6 +33,7 @@ PARSER_MODE = os.getenv("PARSER_MODE", "balanced").strip().lower()
 ENABLE_EASYOCR = os.getenv("ENABLE_EASYOCR", "false").lower() == "true"
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", "1" if PARSER_MODE == "precision_first" else "2"))
 STORAGE_ROOT = Path(os.getenv("STORAGE_ROOT", "/app/storage"))
+JOBS_DB_PATH = STORAGE_ROOT / "jobs.sqlite3"
 
 # Marker / Surya usam MODEL_CACHE_DIR para persistir modelos (~1-2 GB)
 # Deve ser definido ANTES da primeira importação de surya/marker
@@ -60,18 +63,15 @@ def _get_marker_models():
     Os modelos ficam em memória entre requisições para evitar reload.
     """
     global _marker_models, _marker_models_lock
-    import threading
+    import threading as _threading
     import torch
 
     if _marker_models_lock is None:
-        _marker_models_lock = threading.Lock()
+        _marker_models_lock = _threading.Lock()
 
     with _marker_models_lock:
         if _marker_models is None:
             from marker.models import create_model_dict  # type: ignore
-            # Determina device: respeita TORCH_DEVICE env var (já lido pelo Surya Settings),
-            # mas também passa explicitamente para garantir que todos os modelos usem o mesmo device.
-            # ROCm expõe-se como "cuda" via HIP — torch.cuda.is_available() retorna True com ROCm.
             torch_device_env = os.environ.get("TORCH_DEVICE")
             if torch_device_env:
                 device = torch_device_env
@@ -105,14 +105,180 @@ def _preload_marker():
     except Exception as e:
         logger.warning("Falha ao pré-carregar Marker: %s", e)
 
+
 # ---------------------------------------------------------------------------
-# In-memory job store
+# Durable job store (SQLite)
 # ---------------------------------------------------------------------------
 jobs: Dict[str, Dict[str, Any]] = {}
-semaphore: asyncio.Semaphore  # initialised in lifespan
+semaphore: asyncio.Semaphore  # initialised in startup
 purge_tasks: Dict[str, asyncio.Task] = {}
 purge_index_path = STORAGE_ROOT / ".purge_index.json"
 purge_index_lock = asyncio.Lock()
+job_store_lock = threading.RLock()
+
+
+def _job_store_connection() -> sqlite3.Connection:
+    STORAGE_ROOT.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(JOBS_DB_PATH, timeout=30, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    return conn
+
+
+def _init_job_store() -> None:
+    with _job_store_connection() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS jobs (
+                job_id TEXT PRIMARY KEY,
+                tender_id TEXT,
+                status TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                processing_time_s REAL NOT NULL DEFAULT 0,
+                errors_json TEXT NOT NULL DEFAULT '[]',
+                logs_json TEXT NOT NULL DEFAULT '[]',
+                documents_json TEXT NOT NULL DEFAULT '[]',
+                full_text TEXT NOT NULL DEFAULT '',
+                storage_path TEXT,
+                purge_at TEXT,
+                updated_at REAL NOT NULL
+            )
+            """
+        )
+        conn.commit()
+
+
+def _json_dump(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _json_load(raw: Optional[str], fallback: Any) -> Any:
+    if raw in (None, ""):
+        return fallback
+    try:
+        return json.loads(raw)
+    except Exception:
+        return fallback
+
+
+def _row_to_job(row: sqlite3.Row) -> Dict[str, Any]:
+    return {
+        "job_id": row["job_id"],
+        "tender_id": row["tender_id"],
+        "status": row["status"],
+        "created_at": row["created_at"],
+        "processing_time_s": row["processing_time_s"],
+        "errors": _json_load(row["errors_json"], []),
+        "logs": _json_load(row["logs_json"], []),
+        "documents": _json_load(row["documents_json"], []),
+        "full_text": row["full_text"] or "",
+        "storage_path": row["storage_path"],
+        "purge_at": row["purge_at"],
+    }
+
+
+def _job_store_upsert(job: Dict[str, Any]) -> None:
+    payload = {
+        "job_id": job["job_id"],
+        "tender_id": job.get("tender_id"),
+        "status": job.get("status", "pending"),
+        "created_at": job.get("created_at", time.time()),
+        "processing_time_s": job.get("processing_time_s", 0.0),
+        "errors_json": _json_dump(job.get("errors", [])),
+        "logs_json": _json_dump(job.get("logs", [])),
+        "documents_json": _json_dump(job.get("documents", [])),
+        "full_text": job.get("full_text", ""),
+        "storage_path": job.get("storage_path"),
+        "purge_at": job.get("purge_at"),
+        "updated_at": time.time(),
+    }
+    with job_store_lock:
+        with _job_store_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO jobs (
+                    job_id, tender_id, status, created_at, processing_time_s,
+                    errors_json, logs_json, documents_json, full_text,
+                    storage_path, purge_at, updated_at
+                ) VALUES (
+                    :job_id, :tender_id, :status, :created_at, :processing_time_s,
+                    :errors_json, :logs_json, :documents_json, :full_text,
+                    :storage_path, :purge_at, :updated_at
+                )
+                ON CONFLICT(job_id) DO UPDATE SET
+                    tender_id=excluded.tender_id,
+                    status=excluded.status,
+                    created_at=excluded.created_at,
+                    processing_time_s=excluded.processing_time_s,
+                    errors_json=excluded.errors_json,
+                    logs_json=excluded.logs_json,
+                    documents_json=excluded.documents_json,
+                    full_text=excluded.full_text,
+                    storage_path=excluded.storage_path,
+                    purge_at=excluded.purge_at,
+                    updated_at=excluded.updated_at
+                """,
+                payload,
+            )
+            conn.commit()
+
+
+def _job_store_get(job_id: str) -> Optional[Dict[str, Any]]:
+    with _job_store_connection() as conn:
+        row = conn.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+    return _row_to_job(row) if row else None
+
+
+def _job_store_list_recent(limit: int) -> List[Dict[str, Any]]:
+    with _job_store_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM jobs ORDER BY created_at DESC, job_id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return [_row_to_job(row) for row in rows]
+
+
+def _job_store_queue_counts() -> Dict[str, int]:
+    counts = {"pending": 0, "processing": 0, "done": 0}
+    with _job_store_connection() as conn:
+        rows = conn.execute(
+            "SELECT status, COUNT(*) AS total FROM jobs GROUP BY status"
+        ).fetchall()
+    for row in rows:
+        status = row["status"]
+        total = int(row["total"])
+        if status in ("done", "error"):
+            counts["done"] += total
+        elif status in counts:
+            counts[status] = total
+    return counts
+
+
+def _job_store_update(job_id: str, **updates: Any) -> Dict[str, Any]:
+    with job_store_lock:
+        current = _job_store_get(job_id)
+        if current is None:
+            raise KeyError(job_id)
+        current.update(updates)
+        _job_store_upsert(current)
+        return current
+
+
+def _append_job_log(job_id: str, message: str) -> Dict[str, Any]:
+    with job_store_lock:
+        current = _job_store_get(job_id)
+        if current is None:
+            raise KeyError(job_id)
+        logs = list(current.get("logs", []))
+        logs.append(message)
+        current["logs"] = logs
+        _job_store_upsert(current)
+        return current
+
+
+def _replace_job_documents(job_id: str, documents: List[Dict[str, Any]]) -> Dict[str, Any]:
+    return _job_store_update(job_id, documents=documents)
 
 
 # ---------------------------------------------------------------------------
@@ -214,12 +380,11 @@ def _preload_easyocr():
 
 @app.on_event("startup")
 async def startup():
-    import threading
-
     global semaphore
     semaphore = asyncio.Semaphore(MAX_WORKERS)
     STORAGE_ROOT.mkdir(parents=True, exist_ok=True)
     Path(EASYOCR_MODEL_DIR).mkdir(parents=True, exist_ok=True)
+    _init_job_store()
     await _restore_and_schedule_purges()
     logger.info(
         "Parser Monstro iniciado. mode=%s MAX_WORKERS=%d EASYOCR=%s OCR<%.2f REPROCESS<%.2f",
@@ -235,6 +400,9 @@ async def startup():
     if ENABLE_EASYOCR:
         threading.Thread(target=_preload_easyocr, daemon=True, name="easyocr-preload").start()
         logger.info("Thread de pré-carregamento EasyOCR iniciada em background.")
+
+
+_init_job_store()
 
 
 # ---------------------------------------------------------------------------
@@ -260,21 +428,22 @@ def health():
 
 @app.get("/queue")
 def queue_status():
-    pending = sum(1 for j in jobs.values() if j["status"] == "pending")
-    processing = sum(1 for j in jobs.values() if j["status"] == "processing")
-    done = sum(1 for j in jobs.values() if j["status"] in ("done", "error"))
-    return {"pending": pending, "processing": processing, "done": done}
+    return _job_store_queue_counts()
 
 
 @app.get("/jobs/{job_id}")
 def get_job(job_id: str):
-    if job_id not in jobs:
+    job = _job_store_get(job_id)
+    if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
-    return jobs[job_id]
+    return job
 
 
 def _build_job_logs_payload(job_id: str, include_documents: bool = False) -> Dict[str, Any]:
-    job = jobs[job_id]
+    job = _job_store_get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+
     payload: Dict[str, Any] = {
         "job_id": job["job_id"],
         "tender_id": job.get("tender_id"),
@@ -299,12 +468,7 @@ def _build_job_logs_payload(job_id: str, include_documents: bool = False) -> Dic
 
 @app.get("/logs/recent")
 def get_recent_logs(limit: int = Query(default=20, ge=1, le=100)):
-    ordered_jobs = sorted(
-        jobs.values(),
-        key=lambda job: (job.get("created_at") or 0, job.get("job_id") or ""),
-        reverse=True,
-    )
-    selected_jobs = ordered_jobs[:limit]
+    selected_jobs = _job_store_list_recent(limit)
     return {
         "count": len(selected_jobs),
         "items": [_build_job_logs_payload(job["job_id"]) for job in selected_jobs],
@@ -313,8 +477,6 @@ def get_recent_logs(limit: int = Query(default=20, ge=1, le=100)):
 
 @app.get("/logs/job/{job_id}")
 def get_job_logs(job_id: str):
-    if job_id not in jobs:
-        raise HTTPException(status_code=404, detail="Job not found")
     return _build_job_logs_payload(job_id, include_documents=True)
 
 
@@ -380,19 +542,21 @@ async def parse_documents(req: ParseRequest, background_tasks: BackgroundTasks):
     job_id = str(uuid.uuid4())
     purge_at = datetime.now(timezone.utc) + timedelta(days=max(1, req.purge_after_days))
     storage_path = STORAGE_ROOT / req.tender_id
-    jobs[job_id] = {
-        "job_id": job_id,
-        "tender_id": req.tender_id,
-        "status": "pending",
-        "documents": [],
-        "full_text": "",
-        "errors": [],
-        "logs": [],
-        "processing_time_s": 0.0,
-        "created_at": time.time(),
-        "storage_path": str(storage_path),
-        "purge_at": purge_at.isoformat(),
-    }
+    _job_store_upsert(
+        {
+            "job_id": job_id,
+            "tender_id": req.tender_id,
+            "status": "pending",
+            "documents": [],
+            "full_text": "",
+            "errors": [],
+            "logs": [f"[{datetime.now(timezone.utc).isoformat()}] job criado e aguardando worker"],
+            "processing_time_s": 0.0,
+            "created_at": time.time(),
+            "storage_path": str(storage_path),
+            "purge_at": purge_at.isoformat(),
+        }
+    )
     background_tasks.add_task(_process_job, job_id, req)
     return ParseResponse(
         tender_id=req.tender_id,
@@ -466,25 +630,43 @@ async def download_documents(req: DownloadRequest):
 # ---------------------------------------------------------------------------
 async def _process_job(job_id: str, req: ParseRequest):
     async with semaphore:
-        jobs[job_id]["status"] = "processing"
-        t0 = time.time()
-        doc_results: List[Dict] = []
-        errors: List[str] = []
-        use_easyocr = (req.options and req.options.enable_easyocr) or ENABLE_EASYOCR
-        force_ocr = bool(req.options and req.options.force_ocr)
-        target_dir = STORAGE_ROOT / req.tender_id
-        target_dir.mkdir(parents=True, exist_ok=True)
+        _job_store_update(job_id, status="processing")
+        _append_job_log(job_id, f"[{datetime.now(timezone.utc).isoformat()}] worker iniciou processamento")
+        await asyncio.to_thread(_process_job_sync, job_id, req)
+        job = _job_store_get(job_id)
+        purge_at_iso = job.get("purge_at") if job else None
+        if purge_at_iso:
+            purge_at = datetime.fromisoformat(purge_at_iso)
+            if purge_at.tzinfo is None:
+                purge_at = purge_at.replace(tzinfo=timezone.utc)
+            await _upsert_purge_schedule(req.tender_id, purge_at)
 
-        for doc in req.documents:
+
+def _process_job_sync(job_id: str, req: ParseRequest):
+    t0 = time.time()
+    doc_results: List[Dict[str, Any]] = []
+    errors: List[str] = []
+    use_easyocr = (req.options and req.options.enable_easyocr) or ENABLE_EASYOCR
+    force_ocr = bool(req.options and req.options.force_ocr)
+    target_dir = STORAGE_ROOT / req.tender_id
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        for index, doc in enumerate(req.documents, start=1):
+            _append_job_log(job_id, f"[{datetime.now(timezone.utc).isoformat()}] iniciando documento {index}/{len(req.documents)}: {doc.filename}")
             try:
-                results = await _handle_document(doc, target_dir, use_easyocr, force_ocr)
+                results = asyncio.run(_handle_document(doc, target_dir, use_easyocr, force_ocr))
                 doc_results.extend(results)
+                _replace_job_documents(job_id, doc_results)
+                _append_job_log(job_id, f"[{datetime.now(timezone.utc).isoformat()}] documento concluído: {doc.filename} ({len(results)} arquivo(s) gerado(s))")
             except Exception as exc:
                 logger.exception("Erro ao processar %s", doc.filename)
-                errors.append(f"{doc.filename}: {exc}")
+                err = f"{doc.filename}: {exc}"
+                errors.append(err)
+                _job_store_update(job_id, errors=errors)
+                _append_job_log(job_id, f"[erro] {err}")
 
         full_text = "\n\n".join(r["text"] for r in doc_results if r.get("text"))
-        # Persistir textos parseados em disco
         parsed_dir = target_dir / "parsed"
         parsed_dir.mkdir(parents=True, exist_ok=True)
         if full_text:
@@ -493,8 +675,7 @@ async def _process_job(job_id: str, req: ParseRequest):
             if r.get("text") and r.get("filename"):
                 (parsed_dir / (r["filename"] + ".txt")).write_text(r["text"], encoding="utf-8")
 
-        # Aggregate per-document logs into job-level logs
-        all_logs: List[str] = []
+        all_logs = []
         for r in doc_results:
             fname = r.get("filename", "?")
             for entry in r.get("logs", []):
@@ -502,21 +683,39 @@ async def _process_job(job_id: str, req: ParseRequest):
         for err in errors:
             all_logs.append(f"[erro] {err}")
 
-        jobs[job_id].update(
-            status="done" if doc_results else "error",
+        existing = _job_store_get(job_id) or {}
+        merged_logs = list(existing.get("logs", [])) + all_logs
+        status = "done" if doc_results else "error"
+        processing_time = round(time.time() - t0, 2)
+        purge_at = datetime.now(timezone.utc) + timedelta(days=max(1, req.purge_after_days))
+
+        _job_store_update(
+            job_id,
+            status=status,
             documents=doc_results,
             full_text=full_text,
             errors=errors,
-            logs=all_logs,
-            processing_time_s=round(time.time() - t0, 2),
+            logs=merged_logs,
+            processing_time_s=processing_time,
+            storage_path=str(target_dir),
+            purge_at=purge_at.isoformat(),
+        )
+        _append_job_log(job_id, f"[{datetime.now(timezone.utc).isoformat()}] job concluído com status={status} em {processing_time:.2f}s")
+        logger.info("Job %s concluído em %.1fs (%d docs)", job_id, processing_time, len(doc_results))
+    except Exception as exc:
+        logger.exception("Falha fatal no job %s", job_id)
+        processing_time = round(time.time() - t0, 2)
+        current = _job_store_get(job_id) or {}
+        errors = list(current.get("errors", [])) + [str(exc)]
+        logs = list(current.get("logs", [])) + [f"[erro] falha fatal do job: {exc}"]
+        _job_store_update(
+            job_id,
+            status="error",
+            errors=errors,
+            logs=logs,
+            processing_time_s=processing_time,
             storage_path=str(target_dir),
         )
-
-        purge_at = datetime.now(timezone.utc) + timedelta(days=max(1, req.purge_after_days))
-        jobs[job_id]["purge_at"] = purge_at.isoformat()
-        await _upsert_purge_schedule(req.tender_id, purge_at)
-
-        logger.info("Job %s concluído em %.1fs (%d docs)", job_id, jobs[job_id]["processing_time_s"], len(doc_results))
 
 
 async def _handle_document(doc: DocumentInput, tmpdir: Path, use_easyocr: bool, force_ocr: bool) -> List[Dict]:
@@ -528,11 +727,9 @@ async def _handle_document(doc: DocumentInput, tmpdir: Path, use_easyocr: bool, 
         resp.raise_for_status()
     dest.write_bytes(resp.content)
 
-    # Detect real mime type
     mime = magic.from_file(str(dest), mime=True)
     logger.debug("%s → mime=%s", doc.filename, mime)
 
-    # Decompress archives
     files_to_parse: List[Path] = []
     if mime in ("application/zip", "application/x-zip-compressed") or doc.filename.lower().endswith(".zip"):
         files_to_parse = _extract_zip(dest, tmpdir)
@@ -680,7 +877,6 @@ def _parse_file(path: Path, use_easyocr: bool, force_ocr: bool) -> Dict:
     mime = magic.from_file(str(path), mime=True)
     filename = path.name
 
-    # Route by type
     if "pdf" in mime:
         return _parse_pdf(path, use_easyocr, force_ocr)
     elif "word" in mime or "officedocument" in mime or path.suffix.lower() in (".doc", ".docx"):
@@ -697,19 +893,12 @@ def _parse_file(path: Path, use_easyocr: bool, force_ocr: bool) -> Dict:
 
 
 def _parse_pdf(path: Path, use_easyocr: bool, force_ocr: bool) -> Dict:
-    """Parse PDF with ordered fallback chain:
-    1. PyMuPDF  — fast native extraction using embedded text
-    2. Docling  — high-quality layout-aware engine
-    3. Marker   — handles difficult/scanned PDFs → Markdown output
-    4. OCR      — tesseract/easyocr for fully scanned PDFs
-    """
     filename = path.name
     text = ""
     method = ""
     pages = 0
     logs: List[str] = []
 
-    # ── 1) PyMuPDF — rápido, extração nativa ──────────────────────────────────
     try:
         import fitz
         doc = fitz.open(str(path))
@@ -736,9 +925,8 @@ def _parse_pdf(path: Path, use_easyocr: bool, force_ocr: bool) -> Dict:
         else:
             logs.append(f"pymupdf: extraiu {len(text)} chars, {pages}p (score {quality:.2f})")
     elif not logs:
-        logs.append(f"pymupdf: extraiu 0 chars (sem texto nativo)")
+        logs.append("pymupdf: extraiu 0 chars (sem texto nativo)")
 
-    # ── 2) Docling — engine principal de qualidade ─────────────────────────────
     if not text or native_is_weak or force_ocr:
         _docling_available = False
         try:
@@ -754,7 +942,7 @@ def _parse_pdf(path: Path, use_easyocr: bool, force_ocr: bool) -> Dict:
                 from docling.document_converter import PdfFormatOption  # type: ignore
 
                 pipeline_options = PdfPipelineOptions()
-                pipeline_options.do_ocr = False  # Docling só faz layout — OCR é feito pelo EasyOCR no step 4
+                pipeline_options.do_ocr = False
 
                 converter = DocumentConverter(
                     format_options={
@@ -787,8 +975,6 @@ def _parse_pdf(path: Path, use_easyocr: bool, force_ocr: bool) -> Dict:
                 logger.warning("docling falhou em %s: %s", filename, e)
                 logs.append(f"docling: falhou ({e})")
 
-    # ── 3) Marker — fallback para PDFs difíceis → Markdown (API v1+) ─────────
-    # Usa PdfConverter + create_model_dict (marker-pdf >= 1.0.0)
     if not text or native_is_weak or force_ocr:
         try:
             from marker.converters.pdf import PdfConverter  # type: ignore
@@ -806,7 +992,7 @@ def _parse_pdf(path: Path, use_easyocr: bool, force_ocr: bool) -> Dict:
                     pages = marker_pages
                     quality = marker_quality
                     method = "marker"
-                    native_is_weak = quality < FORCE_OCR_IF_SCORE_BELOW  # reavalia após marker
+                    native_is_weak = quality < FORCE_OCR_IF_SCORE_BELOW
                     logs.append(f"marker: extraiu {len(text)} chars, {pages}p (score {quality:.2f})")
                 else:
                     logs.append(f"marker: não melhorou resultado (score {marker_quality:.2f} vs {quality:.2f})")
@@ -819,7 +1005,6 @@ def _parse_pdf(path: Path, use_easyocr: bool, force_ocr: bool) -> Dict:
             logger.warning("marker falhou em %s: %s", filename, e)
             logs.append(f"marker: falhou ({e})")
 
-    # ── 4) OCR — fallback final para PDFs scaneados ───────────────────────────
     if not text or native_is_weak or force_ocr:
         try:
             text_ocr, pages_ocr, ocr_engine = _pdf_ocr_tesseract(path, use_easyocr)
@@ -827,8 +1012,6 @@ def _parse_pdf(path: Path, use_easyocr: bool, force_ocr: bool) -> Dict:
             if ocr_text:
                 ocr_pages = pages_ocr or max(1, pages)
                 ocr_quality = _quality_score(ocr_text, ocr_pages)
-                # Accept OCR if: no text yet, forced, or actually better quality.
-                # Use >= to handle the case where both scores round to 0.0 (sparse/long PDFs).
                 if force_ocr or not text or ocr_quality >= quality:
                     text = ocr_text
                     pages = ocr_pages
@@ -850,14 +1033,12 @@ def _parse_pdf(path: Path, use_easyocr: bool, force_ocr: bool) -> Dict:
 
 
 def _pdf_ocr_tesseract(path: Path, use_easyocr: bool) -> tuple:
-    """Render PDF pages as images and OCR them."""
     import pytesseract
     from PIL import Image
     try:
         from pdf2image import convert_from_path
         images = convert_from_path(str(path), dpi=200)
     except Exception:
-        # fallback: use pymupdf to render
         import fitz
         doc = fitz.open(str(path))
         images = []
@@ -867,7 +1048,6 @@ def _pdf_ocr_tesseract(path: Path, use_easyocr: bool) -> tuple:
             images.append(img)
         doc.close()
 
-    # Build easyocr reader once (not per page — model load is expensive)
     easyocr_reader = None
     if use_easyocr:
         try:
@@ -952,7 +1132,6 @@ def _normalize_text(text: str) -> str:
     txt = txt.replace("\x00", " ")
 
     if CLEAN_OCR_NOISE:
-        # remove linhas com ruído típico de OCR (quase sem vogais e muito símbolo)
         cleaned_lines = []
         for line in txt.splitlines():
             s = line.strip()
@@ -975,15 +1154,12 @@ def _quality_score(text: str, pages: int) -> float:
         return 0.0
     words = len(text.split())
     words_per_page = words / max(pages, 1)
-    # Heuristic: ~250 words/page = good quality (1.0)
     score = min(1.0, words_per_page / 250)
     return round(score, 2)
 
 
 def _make_result(filename, type_detected, method, pages, quality, text, error=None, logs=None) -> Dict:
     normalized_text = _normalize_text(text)
-    # Only recalculate quality if not already provided (pages=0 kills _quality_score).
-    # Callers that already computed quality should pass it explicitly.
     if not quality and normalized_text and pages:
         quality = _quality_score(normalized_text, pages)
     return {
