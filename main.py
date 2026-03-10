@@ -201,7 +201,7 @@ def _preload_easyocr():
     try:
         import easyocr
         logger.info("Pré-carregando modelos EasyOCR (model_storage_directory=%s)...", EASYOCR_MODEL_DIR)
-        _ = easyocr.Reader(["pt", "en"], model_storage_directory=EASYOCR_MODEL_DIR, gpu=False)
+        _ = easyocr.Reader(["pt", "en"], model_storage_directory=EASYOCR_MODEL_DIR, gpu=True)
         logger.info("Modelos EasyOCR carregados com sucesso.")
     except Exception as e:
         logger.warning("Falha ao pré-carregar EasyOCR: %s", e)
@@ -823,7 +823,7 @@ def _pdf_ocr_tesseract(path: Path, use_easyocr: bool) -> tuple:
         try:
             import easyocr
             import numpy as np
-            easyocr_reader = easyocr.Reader(["pt", "en"], model_storage_directory=EASYOCR_MODEL_DIR, gpu=False)
+            easyocr_reader = easyocr.Reader(["pt", "en"], model_storage_directory=EASYOCR_MODEL_DIR, gpu=True)
         except Exception as _ocr_init_err:
             logger.warning("easyocr init falhou, usando tesseract: %s", _ocr_init_err)
 
@@ -877,7 +877,7 @@ def _parse_image_ocr(path: Path, use_easyocr: bool) -> Dict:
             try:
                 import easyocr
                 import numpy as np
-                reader = easyocr.Reader(["pt", "en"], model_storage_directory=EASYOCR_MODEL_DIR, gpu=False)
+                reader = easyocr.Reader(["pt", "en"], model_storage_directory=EASYOCR_MODEL_DIR, gpu=True)
                 result = reader.readtext(np.array(img))
                 text = " ".join(r[1] for r in result)
                 return _make_result(filename, "image", "easyocr", 1, _quality_score(text, 1), text)
