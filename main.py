@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 import magic
-from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
 from pydantic import BaseModel
 
 from zip_recursive import ZipExtractionLimits, extract_zip_recursive, write_extracted_files
@@ -271,6 +271,51 @@ def get_job(job_id: str):
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
     return jobs[job_id]
+
+
+def _build_job_logs_payload(job_id: str, include_documents: bool = False) -> Dict[str, Any]:
+    job = jobs[job_id]
+    payload: Dict[str, Any] = {
+        "job_id": job["job_id"],
+        "tender_id": job.get("tender_id"),
+        "status": job.get("status"),
+        "created_at": job.get("created_at"),
+        "processing_time_s": job.get("processing_time_s", 0.0),
+        "errors": job.get("errors", []),
+        "logs": job.get("logs", []),
+    }
+    if include_documents:
+        payload["documents"] = [
+            {
+                "filename": doc.get("filename"),
+                "method_used": doc.get("method_used"),
+                "error": doc.get("error"),
+                "logs": doc.get("logs", []),
+            }
+            for doc in job.get("documents", [])
+        ]
+    return payload
+
+
+@app.get("/logs/recent")
+def get_recent_logs(limit: int = Query(default=20, ge=1, le=100)):
+    ordered_jobs = sorted(
+        jobs.values(),
+        key=lambda job: (job.get("created_at") or 0, job.get("job_id") or ""),
+        reverse=True,
+    )
+    selected_jobs = ordered_jobs[:limit]
+    return {
+        "count": len(selected_jobs),
+        "items": [_build_job_logs_payload(job["job_id"]) for job in selected_jobs],
+    }
+
+
+@app.get("/logs/job/{job_id}")
+def get_job_logs(job_id: str):
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return _build_job_logs_payload(job_id, include_documents=True)
 
 
 @app.get("/storage/{tender_id}")
