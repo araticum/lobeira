@@ -129,11 +129,28 @@ class EnrichmentResult(BaseModel):
 app = FastAPI(title="Parser Monstro", version="1.0.0")
 
 
+EASYOCR_MODEL_DIR = str(STORAGE_ROOT / "easyocr_models")
+
+
+def _preload_easyocr():
+    """Pré-carrega modelos EasyOCR em background para evitar delay na primeira inferência."""
+    try:
+        import easyocr
+        logger.info("Pré-carregando modelos EasyOCR (model_storage_directory=%s)...", EASYOCR_MODEL_DIR)
+        _ = easyocr.Reader(["pt", "en"], model_storage_directory=EASYOCR_MODEL_DIR, gpu=False)
+        logger.info("Modelos EasyOCR carregados com sucesso.")
+    except Exception as e:
+        logger.warning("Falha ao pré-carregar EasyOCR: %s", e)
+
+
 @app.on_event("startup")
 async def startup():
+    import threading
+
     global semaphore
     semaphore = asyncio.Semaphore(MAX_WORKERS)
     STORAGE_ROOT.mkdir(parents=True, exist_ok=True)
+    Path(EASYOCR_MODEL_DIR).mkdir(parents=True, exist_ok=True)
     await _restore_and_schedule_purges()
     logger.info(
         "Parser Monstro iniciado. mode=%s MAX_WORKERS=%d EASYOCR=%s OCR<%.2f REPROCESS<%.2f",
@@ -143,6 +160,9 @@ async def startup():
         FORCE_OCR_IF_SCORE_BELOW,
         REPROCESS_IF_SCORE_BELOW,
     )
+    if ENABLE_EASYOCR:
+        threading.Thread(target=_preload_easyocr, daemon=True, name="easyocr-preload").start()
+        logger.info("Thread de pré-carregamento EasyOCR iniciada em background.")
 
 
 # ---------------------------------------------------------------------------
@@ -733,7 +753,7 @@ def _pdf_ocr_tesseract(path: Path, use_easyocr: bool) -> tuple:
         try:
             import easyocr
             import numpy as np
-            easyocr_reader = easyocr.Reader(["pt", "en"])
+            easyocr_reader = easyocr.Reader(["pt", "en"], model_storage_directory=EASYOCR_MODEL_DIR, gpu=False)
         except Exception as _ocr_init_err:
             logger.warning("easyocr init falhou, usando tesseract: %s", _ocr_init_err)
 
@@ -787,7 +807,7 @@ def _parse_image_ocr(path: Path, use_easyocr: bool) -> Dict:
             try:
                 import easyocr
                 import numpy as np
-                reader = easyocr.Reader(["pt", "en"])
+                reader = easyocr.Reader(["pt", "en"], model_storage_directory=EASYOCR_MODEL_DIR, gpu=False)
                 result = reader.readtext(np.array(img))
                 text = " ".join(r[1] for r in result)
                 return _make_result(filename, "image", "easyocr", 1, _quality_score(text, 1), text)
