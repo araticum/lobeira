@@ -41,6 +41,16 @@ JOBS_DB_PATH = STORAGE_ROOT / "jobs.sqlite3"
 # ROCm/HIP segue a semântica de torch.cuda; usar device="cuda" é o caminho certo.
 # Preferimos defaults conservadores de alocador/workspace para reduzir fragmentação/OOM,
 # sem sobrescrever overrides explícitos de runtime/deploy.
+# ROCm tuning (WSL stability)
+os.environ.setdefault(
+    "PYTORCH_HIP_ALLOC_CONF",
+    "garbage_collection_threshold:0.8,max_split_size_mb:128"
+)
+
+os.environ.setdefault("HSA_ENABLE_SDMA", "0")
+
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+os.environ.setdefault("HIPBLAS_WORKSPACE_CONFIG", ":4096:8")
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 os.environ.setdefault("HIPBLAS_WORKSPACE_CONFIG", ":4096:8")
 
