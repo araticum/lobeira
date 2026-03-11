@@ -87,6 +87,8 @@ E adicione o serviço `parser` ao mesmo compose (ou use a rede Docker interna).
 | `ENABLE_EASYOCR` | `false` | Mantida apenas por compatibilidade; o runtime atual ignora a flag e desabilita EasyOCR |
 | `PYTORCH_CUDA_ALLOC_CONF` | `expandable_segments:True` | Default conservador para reduzir fragmentação/OOM em ROCm |
 | `HIPBLAS_WORKSPACE_CONFIG` | `:4096:8` | Limita workspace hipBLAS por padrão sem sobrescrever override explícito |
+| `RECOGNITION_BATCH_SIZE` | `64` | Default conservador para Surya/Marker em GPU; pode ser sobrescrito no deploy |
+| `DETECTOR_BATCH_SIZE` | `8` | Default conservador para Surya/Marker em GPU; pode ser sobrescrito no deploy |
 | `MAX_WORKERS` | `2` | Jobs simultâneos |
 | `LOG_LEVEL` | `INFO` | Nível de log (DEBUG/INFO/WARNING) |
 | `STORAGE_ROOT` | `/app/storage` | Pasta de armazenamento temporário |
@@ -115,8 +117,18 @@ O endpoint `GET /logs/system/recent` foi pensado para o cenário real em Linux c
 2. arquivo local definido por `PARSER_SYSTEM_LOG_PATH`
 3. buffer em memória do processo atual
 
-Por padrão o endpoint remove linhas ruidosas de access log/health/queue/logs para destacar mensagens úteis de runtime (ex.: ROCm, fallback, init de modelos, OOM, warnings). Use `include_access_logs=true` para ver tudo.
+Por padrão o endpoint remove linhas ruidosas de access log/health/queue/logs para destacar mensagens úteis de runtime (ex.: ROCm, fallback, init de modelos, OOM, warnings). Use `include_access_logs=true` para ver tudo. O parser também normaliza mensagens não-string vindas do journal (listas, bytes, dicts em JSON), evitando o fallback espúrio com warning `expected string or bytes-like object`.
 
 ### Caveat de permissão
 
 Em alguns deploys o processo do parser pode não ter permissão para ler o journal do host. Nesse caso o endpoint não quebra: ele retorna `warnings` explicando a falha e usa o fallback disponível. Para ter a visão mais completa, garanta que o serviço possa executar `journalctl` com acesso ao journal correspondente, ou configure `PARSER_SYSTEM_LOG_PATH`.
+
+## Nota sobre ROCm + Marker/Surya
+
+O runtime continua **GPU-first**: não há downgrade silencioso para CPU. Para reduzir a chance de OOM depois do docling, o serviço agora:
+
+- aplica defaults de batch mais conservadores para Surya (`RECOGNITION_BATCH_SIZE=64`, `DETECTOR_BATCH_SIZE=8`) quando o deploy não define overrides;
+- faz `gc.collect()` + `torch.cuda.empty_cache()` nas fronteiras das etapas GPU;
+- registra snapshots de memória/config antes/depois/falha do Marker.
+
+Isso melhora estabilidade, mas não elimina totalmente OOM em PDFs grandes/complexos no stack atual ROCm + marker/surya. Se ainda houver `HIP out of memory`, o próximo passo provável é ajuste adicional de batch/config por deploy ou mudança de versão/configuração upstream da biblioteca.

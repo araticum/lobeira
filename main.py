@@ -5,6 +5,7 @@ API REST FastAPI — roda em container isolado na porta 7000.
 
 import asyncio
 import base64
+import gc
 import json
 import logging
 import subprocess
@@ -47,6 +48,12 @@ os.environ.setdefault("HIPBLAS_WORKSPACE_CONFIG", ":4096:8")
 # Deve ser definido ANTES da primeira importação de surya/marker
 MARKER_MODEL_DIR = str(STORAGE_ROOT / "marker_models")
 os.environ.setdefault("MODEL_CACHE_DIR", MARKER_MODEL_DIR)
+
+# Batch sizes default mais conservadores para ROCm/HIP.
+# Surya costuma escalar demais por padrão em GPU (ex.: recognition 512 ~= ~20GB VRAM),
+# então baixamos o default sem impedir override explícito via env/deploy.
+os.environ.setdefault("RECOGNITION_BATCH_SIZE", os.getenv("MARKER_RECOGNITION_BATCH_SIZE_DEFAULT", "64"))
+os.environ.setdefault("DETECTOR_BATCH_SIZE", os.getenv("MARKER_DETECTOR_BATCH_SIZE_DEFAULT", "8"))
 
 # Precision-first knobs (safe defaults for quality)
 FORCE_OCR_IF_SCORE_BELOW = float(os.getenv("FORCE_OCR_IF_SCORE_BELOW", "0.82" if PARSER_MODE == "precision_first" else "0.65"))
@@ -151,20 +158,43 @@ def _log_torch_runtime(label: str, logs: Optional[List[str]] = None) -> None:
         logs.append(msg)
 
 
+def _marker_runtime_settings() -> Dict[str, Optional[str]]:
+    return {
+        "torch_device": os.environ.get("TORCH_DEVICE"),
+        "recognition_batch_size": os.environ.get("RECOGNITION_BATCH_SIZE"),
+        "detector_batch_size": os.environ.get("DETECTOR_BATCH_SIZE"),
+        "model_cache_dir": os.environ.get("MODEL_CACHE_DIR"),
+    }
+
+
+def _log_marker_runtime_settings(logs: Optional[List[str]] = None) -> None:
+    settings = _marker_runtime_settings()
+    msg = f"marker:settings={json.dumps(settings, ensure_ascii=False, sort_keys=True)}"
+    logger.info(msg)
+    if logs is not None:
+        logs.append(msg)
+
+
 def _torch_empty_cache(logs: Optional[List[str]] = None, reason: Optional[str] = None) -> None:
     try:
         import torch
         if getattr(torch.cuda, "is_available", lambda: False)():
+            gc.collect()
+            if hasattr(torch.cuda, "synchronize"):
+                try:
+                    torch.cuda.synchronize()
+                except Exception as sync_exc:
+                    logger.debug("Falha ao sincronizar torch antes de empty_cache: %s", sync_exc)
             torch.cuda.empty_cache()
             suffix = f" ({reason})" if reason else ""
-            detail = f"torch.cuda.empty_cache() executado{suffix}"
+            detail = f"gc.collect() + torch.cuda.empty_cache() executado{suffix}"
             logger.info(detail)
             if logs is not None:
                 logs.append(detail)
     except Exception as exc:
         logger.debug("Falha ao limpar cache torch: %s", exc)
         if logs is not None:
-            logs.append(f"torch.cuda.empty_cache() falhou: {exc}")
+            logs.append(f"torch cache cleanup falhou: {exc}")
 
 
 def _effective_easyocr_enabled(requested: bool) -> bool:
@@ -224,6 +254,7 @@ def _get_marker_models():
                 getattr(torch.version, "hip", "N/A"),
                 torch_device_env or "<não definido>",
             )
+            _log_marker_runtime_settings()
             _log_torch_runtime("marker:init:before-load")
             _marker_models = create_model_dict(device=device)
             _log_torch_runtime("marker:init:after-load")
@@ -243,6 +274,7 @@ def _preload_marker():
             getattr(torch.version, "hip", "N/A"),
         )
         with _gpu_stage_lock:
+            _log_marker_runtime_settings()
             _log_torch_runtime("marker:preload:before")
             _get_marker_models()
             _log_torch_runtime("marker:preload:after")
@@ -589,13 +621,31 @@ def _normalize_system_log_entry(entry: Dict[str, Any], source: str) -> Dict[str,
         "level": entry.get("level") or entry.get("PRIORITY") or entry.get("priority"),
         "logger": entry.get("logger") or entry.get("SYSLOG_IDENTIFIER") or entry.get("_COMM"),
         "pid": entry.get("pid") or entry.get("_PID"),
-        "message": entry.get("message") or entry.get("MESSAGE") or "",
+        "message": _stringify_system_log_message(entry.get("message") or entry.get("MESSAGE") or ""),
         "source": source,
     }
 
 
-def _is_noisy_system_log_message(message: str) -> bool:
-    return any(pattern.search(message or "") for pattern in SYSTEM_LOG_ACCESS_PATTERNS)
+def _stringify_system_log_message(message: Any) -> str:
+    if message is None:
+        return ""
+    if isinstance(message, str):
+        return message
+    if isinstance(message, bytes):
+        return message.decode("utf-8", errors="replace")
+    if isinstance(message, (list, tuple)):
+        return " ".join(part for part in (_stringify_system_log_message(item) for item in message) if part)
+    if isinstance(message, dict):
+        try:
+            return json.dumps(message, ensure_ascii=False, sort_keys=True)
+        except Exception:
+            return str(message)
+    return str(message)
+
+
+def _is_noisy_system_log_message(message: Any) -> bool:
+    text = _stringify_system_log_message(message)
+    return any(pattern.search(text) for pattern in SYSTEM_LOG_ACCESS_PATTERNS)
 
 
 def _filter_system_log_entries(
@@ -608,7 +658,8 @@ def _filter_system_log_entries(
     filtered: List[Dict[str, Any]] = []
     for raw_entry in entries:
         entry = _normalize_system_log_entry(raw_entry, raw_entry.get("source", "unknown"))
-        message = entry.get("message") or ""
+        message = _stringify_system_log_message(entry.get("message") or "")
+        entry["message"] = message
         if not include_access_logs and _is_noisy_system_log_message(message):
             continue
         if contains_normalized and contains_normalized not in message.lower():
@@ -1258,8 +1309,9 @@ def _parse_pdf(path: Path, use_easyocr: bool, force_ocr: bool) -> Dict:
                     converter = _get_docling_converter()
                     result = converter.convert(str(path))
                     _log_torch_runtime("docling:after", logs)
-                _torch_empty_cache(logs, "após docling")
                 docling_text = result.document.export_to_text() if result and result.document else ""
+                del result
+                _torch_empty_cache(logs, "após docling")
                 docling_text = _normalize_text(docling_text)
                 if docling_text:
                     docling_pages = pages or 1
@@ -1288,13 +1340,17 @@ def _parse_pdf(path: Path, use_easyocr: bool, force_ocr: bool) -> Dict:
         try:
             from marker.converters.pdf import PdfConverter  # type: ignore
             from marker.output import text_from_rendered  # type: ignore
+            full_text_md = ""
             with _gpu_stage_lock:
                 _torch_empty_cache(logs, "antes do marker")
+                _log_marker_runtime_settings(logs)
                 _log_torch_runtime("marker:before", logs)
                 models = _get_marker_models()
                 converter = PdfConverter(artifact_dict=models)
                 rendered = converter(str(path))
                 full_text_md, _, _ = text_from_rendered(rendered)
+                del rendered
+                del converter
                 _log_torch_runtime("marker:after", logs)
             _torch_empty_cache(logs, "após marker")
             marker_text = _normalize_text(full_text_md or "")
@@ -1316,6 +1372,8 @@ def _parse_pdf(path: Path, use_easyocr: bool, force_ocr: bool) -> Dict:
             logger.warning("marker não instalado — pulando etapa 3 do fallback para %s", filename)
             logs.append("marker: não instalado — pulado")
         except Exception as e:
+            _torch_empty_cache(logs, "falha do marker")
+            _log_torch_runtime("marker:failure", logs)
             logger.warning("marker falhou em %s: %s", filename, e)
             logs.append(f"marker: falhou ({e})")
 

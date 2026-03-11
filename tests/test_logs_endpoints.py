@@ -207,6 +207,33 @@ class LogsEndpointsTests(unittest.TestCase):
         self.assertTrue(payload["warnings"])
         self.assertTrue(any("GPU OOM" in item["message"] for item in payload["items"]))
 
+    def test_get_recent_system_logs_handles_non_string_journal_messages(self):
+        lines = "\n".join([
+            json.dumps({
+                "__REALTIME_TIMESTAMP": "1710000000000000",
+                "PRIORITY": "6",
+                "SYSLOG_IDENTIFIER": "parser-monstro",
+                "MESSAGE": ["GET /logs/system/recent", "200"],
+            }),
+            json.dumps({
+                "__REALTIME_TIMESTAMP": "1710000001000000",
+                "PRIORITY": "4",
+                "SYSLOG_IDENTIFIER": "parser-monstro",
+                "MESSAGE": {"event": "marker", "detail": "HIP OOM trying to allocate"},
+            }),
+        ])
+        original_run = self.main.subprocess.run
+        self.main.subprocess.run = lambda *args, **kwargs: _CompletedProcess(stdout=lines, returncode=0)
+        try:
+            payload = self.main.get_recent_system_logs(limit=20, contains="HIP OOM", include_access_logs=False)
+        finally:
+            self.main.subprocess.run = original_run
+
+        self.assertEqual(payload["backend"], "journalctl")
+        self.assertEqual(payload["count"], 1)
+        self.assertIn("HIP OOM", payload["items"][0]["message"])
+        self.assertNotIn("expected string or bytes-like object", " ".join(payload["warnings"]))
+
     def test_get_recent_system_logs_file_fallback_respects_contains_filter(self):
         system_log_path = Path(self.tmpdir) / "parser-system.log"
         system_log_path.write_text("GET /queue 200\nMarker loaded successfully\nROCm fallback enabled\n", encoding="utf-8")
@@ -222,6 +249,44 @@ class LogsEndpointsTests(unittest.TestCase):
         self.assertEqual(payload["backend"], "file")
         self.assertEqual(payload["count"], 1)
         self.assertEqual(payload["items"][0]["message"], "ROCm fallback enabled")
+
+    def test_marker_runtime_defaults_are_conservative(self):
+        self.assertEqual(os.environ.get("RECOGNITION_BATCH_SIZE"), "64")
+        self.assertEqual(os.environ.get("DETECTOR_BATCH_SIZE"), "8")
+
+    def test_torch_empty_cache_runs_gc_and_cuda_cleanup(self):
+        calls = []
+
+        class _FakeCuda:
+            @staticmethod
+            def is_available():
+                return True
+
+            @staticmethod
+            def synchronize():
+                calls.append("synchronize")
+
+            @staticmethod
+            def empty_cache():
+                calls.append("empty_cache")
+
+        fake_torch = types.SimpleNamespace(cuda=_FakeCuda())
+        original_torch = sys.modules.get("torch")
+        original_gc_collect = self.main.gc.collect
+        sys.modules["torch"] = fake_torch
+        self.main.gc.collect = lambda: calls.append("gc.collect")
+        logs = []
+        try:
+            self.main._torch_empty_cache(logs, "teste")
+        finally:
+            self.main.gc.collect = original_gc_collect
+            if original_torch is None:
+                sys.modules.pop("torch", None)
+            else:
+                sys.modules["torch"] = original_torch
+
+        self.assertEqual(calls, ["gc.collect", "synchronize", "empty_cache"])
+        self.assertTrue(any("teste" in entry for entry in logs))
 
     def test_active_job_logs_and_queue_remain_visible_during_processing(self):
         req = self.main.ParseRequest(
