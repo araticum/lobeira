@@ -52,8 +52,8 @@ os.environ.setdefault("MODEL_CACHE_DIR", MARKER_MODEL_DIR)
 # Batch sizes default mais conservadores para ROCm/HIP.
 # Surya costuma escalar demais por padrão em GPU (ex.: recognition 512 ~= ~20GB VRAM),
 # então baixamos o default sem impedir override explícito via env/deploy.
-os.environ.setdefault("RECOGNITION_BATCH_SIZE", os.getenv("MARKER_RECOGNITION_BATCH_SIZE_DEFAULT", "64"))
-os.environ.setdefault("DETECTOR_BATCH_SIZE", os.getenv("MARKER_DETECTOR_BATCH_SIZE_DEFAULT", "8"))
+os.environ.setdefault("RECOGNITION_BATCH_SIZE", os.getenv("MARKER_RECOGNITION_BATCH_SIZE_DEFAULT", "16"))
+os.environ.setdefault("DETECTOR_BATCH_SIZE", os.getenv("MARKER_DETECTOR_BATCH_SIZE_DEFAULT", "4"))
 
 # Precision-first knobs (safe defaults for quality)
 FORCE_OCR_IF_SCORE_BELOW = float(os.getenv("FORCE_OCR_IF_SCORE_BELOW", "0.82" if PARSER_MODE == "precision_first" else "0.65"))
@@ -562,8 +562,8 @@ async def startup():
     )
     _log_torch_runtime("startup")
     Path(MARKER_MODEL_DIR).mkdir(parents=True, exist_ok=True)
-    threading.Thread(target=_preload_marker, daemon=True, name="marker-preload").start()
-    logger.info("Thread de pré-carregamento Marker iniciada em background.")
+    # preload removido para evitar reset da GPU no WSL
+    # threading.Thread(target=_preload_marker, daemon=True, name="marker-preload").start()
     if ENABLE_EASYOCR:
         logger.warning("ENABLE_EASYOCR=true ignorado: %s", EASYOCR_DISABLED_REASON)
 
