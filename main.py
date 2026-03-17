@@ -12,6 +12,7 @@ import subprocess
 from collections import deque
 import os
 import re
+import requests
 import sqlite3
 import threading
 import time
@@ -535,8 +536,9 @@ def _compute_progress(documents_done: int, documents_total: int, status: str) ->
 # Pydantic models
 # ---------------------------------------------------------------------------
 class DocumentInput(BaseModel):
-    url: str
     filename: str
+    url: Optional[str] = None
+    path: Optional[str] = None
 
 
 class ParseOptions(BaseModel):
@@ -546,7 +548,9 @@ class ParseOptions(BaseModel):
 
 class ParseRequest(BaseModel):
     tender_id: str
-    documents: List[DocumentInput]
+    documents: List[DocumentInput] = []
+    manifest_url: Optional[str] = None
+    storage_prefix: Optional[str] = None
     purge_after_days: int = 7
     options: Optional[ParseOptions] = None
     pipeline_job_id: Optional[int] = None
@@ -1005,12 +1009,37 @@ async def delete_storage(tender_id: str):
     return {"tender_id": tender_id, "deleted": True}
 
 
+
+def _load_manifest_documents(req: ParseRequest) -> List[DocumentInput]:
+    if req.documents:
+        return req.documents
+    if not req.manifest_url:
+        return []
+    resp = requests.get(req.manifest_url, timeout=60)
+    resp.raise_for_status()
+    manifest = resp.json()
+    docs: List[DocumentInput] = []
+    for item in manifest.get("prepared_files") or []:
+        if not isinstance(item, dict):
+            continue
+        url = item.get("url")
+        path = item.get("path")
+        filename = Path(str(item.get("filename") or item.get("storage_key") or "documento")).name
+        if not url and not path:
+            continue
+        docs.append(DocumentInput(filename=filename, url=url, path=path))
+    return docs
+
+
 # ---------------------------------------------------------------------------
 # Main parse endpoint
 # ---------------------------------------------------------------------------
 @app.post("/parse", response_model=ParseResponse, status_code=202)
 async def parse_documents(req: ParseRequest, background_tasks: BackgroundTasks):
     job_id = str(uuid.uuid4())
+    documents = _load_manifest_documents(req)
+    if not documents:
+        raise HTTPException(status_code=400, detail="No documents resolved for parse request")
     purge_at = datetime.now(timezone.utc) + timedelta(days=max(1, req.purge_after_days))
     storage_path = STORAGE_ROOT / req.tender_id
     _job_store_upsert(
@@ -1028,7 +1057,7 @@ async def parse_documents(req: ParseRequest, background_tasks: BackgroundTasks):
             "processing_time_s": 0.0,
             "progress_pct": 0,
             "documents_done": 0,
-            "documents_total": len(req.documents),
+            "documents_total": len(documents),
             "current_document": None,
             "current_step": "queued",
             "created_at": time.time(),
@@ -1037,8 +1066,8 @@ async def parse_documents(req: ParseRequest, background_tasks: BackgroundTasks):
             "purge_at": purge_at.isoformat(),
         }
     )
-    background_tasks.add_task(_process_job, job_id, req)
-    logger.info("parser_job_queued job_id=%s tender_id=%s pipeline_job_id=%s correlation_id=%s celery_task_id=%s docs_total=%s", job_id, req.tender_id, req.pipeline_job_id, req.correlation_id, req.celery_task_id, len(req.documents))
+    background_tasks.add_task(_process_job, job_id, req, documents)
+    logger.info("parser_job_queued job_id=%s tender_id=%s pipeline_job_id=%s correlation_id=%s celery_task_id=%s docs_total=%s", job_id, req.tender_id, req.pipeline_job_id, req.correlation_id, req.celery_task_id, len(documents))
     return ParseResponse(
         tender_id=req.tender_id,
         status="pending",
@@ -1112,12 +1141,12 @@ async def download_documents(req: DownloadRequest):
 # ---------------------------------------------------------------------------
 # Background processing
 # ---------------------------------------------------------------------------
-async def _process_job(job_id: str, req: ParseRequest):
+async def _process_job(job_id: str, req: ParseRequest, documents: List[DocumentInput]):
     async with semaphore:
-        _job_store_update(job_id, status="processing", progress_pct=0, documents_done=0, documents_total=len(req.documents), current_document=None, current_step="starting", updated_at=time.time())
+        _job_store_update(job_id, status="processing", progress_pct=0, documents_done=0, documents_total=len(documents), current_document=None, current_step="starting", updated_at=time.time())
         _append_job_log(job_id, f"[{datetime.now(timezone.utc).isoformat()}] worker iniciou processamento")
-        logger.info("parser_job_started job_id=%s tender_id=%s pipeline_job_id=%s correlation_id=%s celery_task_id=%s documentos=%d", job_id, req.tender_id, req.pipeline_job_id, req.correlation_id, req.celery_task_id, len(req.documents))
-        await asyncio.to_thread(_process_job_sync, job_id, req)
+        logger.info("parser_job_started job_id=%s tender_id=%s pipeline_job_id=%s correlation_id=%s celery_task_id=%s documentos=%d", job_id, req.tender_id, req.pipeline_job_id, req.correlation_id, req.celery_task_id, len(documents))
+        await asyncio.to_thread(_process_job_sync, job_id, req, documents)
         job = _job_store_get(job_id)
         purge_at_iso = job.get("purge_at") if job else None
         if purge_at_iso:
@@ -1127,7 +1156,7 @@ async def _process_job(job_id: str, req: ParseRequest):
             await _upsert_purge_schedule(req.tender_id, purge_at)
 
 
-def _process_job_sync(job_id: str, req: ParseRequest):
+def _process_job_sync(job_id: str, req: ParseRequest, documents: List[DocumentInput]):
     t0 = time.time()
     doc_results: List[Dict[str, Any]] = []
     errors: List[str] = []
@@ -1136,13 +1165,13 @@ def _process_job_sync(job_id: str, req: ParseRequest):
     target_dir = STORAGE_ROOT / req.tender_id
     target_dir.mkdir(parents=True, exist_ok=True)
 
-    documents_total = len(req.documents)
+    documents_total = len(documents)
     documents_done = 0
     try:
-        for index, doc in enumerate(req.documents, start=1):
+        for index, doc in enumerate(documents, start=1):
             _job_store_update(job_id, documents_done=documents_done, documents_total=documents_total, progress_pct=_compute_progress(documents_done, documents_total, 'processing'), current_document=doc.filename, current_step='starting_document', updated_at=time.time())
-            _append_job_log(job_id, f"[{datetime.now(timezone.utc).isoformat()}] iniciando documento {index}/{len(req.documents)}: {doc.filename}")
-            logger.info("Job %s processando documento %s/%s: %s", job_id, index, len(req.documents), doc.filename)
+            _append_job_log(job_id, f"[{datetime.now(timezone.utc).isoformat()}] iniciando documento {index}/{len(documents)}: {doc.filename}")
+            logger.info("Job %s processando documento %s/%s: %s", job_id, index, len(documents), doc.filename)
             try:
                 results = asyncio.run(_handle_document(doc, target_dir, use_easyocr, force_ocr))
                 doc_results.extend(results)
@@ -1214,8 +1243,8 @@ def _process_job_sync(job_id: str, req: ParseRequest):
             processing_time_s=processing_time,
             storage_path=str(target_dir),
             documents_done=documents_done if 'documents_done' in locals() else 0,
-            documents_total=documents_total if 'documents_total' in locals() else len(req.documents),
-            progress_pct=_compute_progress(documents_done if 'documents_done' in locals() else 0, documents_total if 'documents_total' in locals() else len(req.documents), 'error'),
+            documents_total=documents_total if 'documents_total' in locals() else len(documents),
+            progress_pct=_compute_progress(documents_done if 'documents_done' in locals() else 0, documents_total if 'documents_total' in locals() else len(documents), 'error'),
             current_document=None,
             current_step='fatal_error',
             updated_at=time.time(),
