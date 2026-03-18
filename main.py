@@ -51,7 +51,18 @@ os.environ.setdefault(
 os.environ.setdefault("HSA_ENABLE_SDMA", "0")
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True,max_split_size_mb:512")
-os.environ.setdefault("HIPBLAS_WORKSPACE_CONFIG", ":4096:8")
+
+# HIPBLAS_WORKSPACE_CONFIG=:0:0 — zera o workspace hipBLAS (antes era :4096:8 = até 4 GB)
+os.environ.setdefault("HIPBLAS_WORKSPACE_CONFIG", ":0:0")
+
+# MIOpen auto-tuning aloca workspaces enormes de convolução — FAST usa heurísticas sem alocar
+os.environ.setdefault("MIOPEN_FIND_MODE", "FAST")
+
+# gfx1101 (RX 7800 XT) não tem suporte nativo hipBLASLt — forçar rocBLAS evita alocações extras
+os.environ.setdefault("TORCH_BLAS_PREFER_HIPBLASLT", "0")
+
+# Desabilita o caching allocator do PyTorch — aloca direto no HIP, elimina fragmentação
+os.environ.setdefault("PYTORCH_NO_CUDA_MEMORY_CACHING", "1")
 
 # Marker / Surya usam MODEL_CACHE_DIR para persistir modelos (~1-2 GB)
 # Deve ser definido ANTES da primeira importação de surya/marker
@@ -216,6 +227,10 @@ def _marker_runtime_settings() -> Dict[str, Optional[str]]:
         "inference_ram": os.environ.get("INFERENCE_RAM"),
         "vram_per_task": os.environ.get("VRAM_PER_TASK"),
         "pytorch_cuda_alloc_conf": os.environ.get("PYTORCH_CUDA_ALLOC_CONF"),
+        "hipblas_workspace_config": os.environ.get("HIPBLAS_WORKSPACE_CONFIG"),
+        "miopen_find_mode": os.environ.get("MIOPEN_FIND_MODE"),
+        "torch_blas_prefer_hipblaslt": os.environ.get("TORCH_BLAS_PREFER_HIPBLASLT"),
+        "pytorch_no_cuda_memory_caching": os.environ.get("PYTORCH_NO_CUDA_MEMORY_CACHING"),
         "model_cache_dir": os.environ.get("MODEL_CACHE_DIR"),
     }
     # loga os valores efetivos do surya para confirmar que chegaram
