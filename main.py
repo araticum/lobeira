@@ -331,6 +331,14 @@ def _get_marker_models():
                 except Exception as _patch_err:
                     logger.warning("marker: falha ao aplicar patch MODEL_DTYPE: %s", _patch_err)
 
+            # Verifica o dtype efetivo após patch — loga pra aparecer nos job logs
+            try:
+                from marker.settings import settings as _ms_check  # type: ignore
+                _effective_dtype = str(getattr(_ms_check, 'MODEL_DTYPE', 'unknown'))
+                logger.info("marker: MODEL_DTYPE efetivo antes do load = %s", _effective_dtype)
+            except Exception as _de:
+                logger.info("marker: não foi possível verificar MODEL_DTYPE: %s", _de)
+
             _log_marker_runtime_settings()
             _log_torch_runtime("marker:init:before-load")
             _marker_models = create_model_dict(device=device)
