@@ -155,6 +155,8 @@ def _torch_runtime_snapshot() -> Dict[str, Any]:
                 "device_name": torch.cuda.get_device_name(idx),
                 "memory_allocated_mb": round(torch.cuda.memory_allocated(idx) / (1024 * 1024), 2),
                 "memory_reserved_mb": round(torch.cuda.memory_reserved(idx) / (1024 * 1024), 2),
+                "max_memory_allocated_mb": round(torch.cuda.max_memory_allocated(idx) / (1024 * 1024), 2),
+                "max_memory_reserved_mb": round(torch.cuda.max_memory_reserved(idx) / (1024 * 1024), 2),
             })
         except Exception as exc:
             snapshot["device_error"] = str(exc)
@@ -1518,6 +1520,13 @@ def _parse_pdf(path: Path, use_easyocr: bool, force_ocr: bool) -> Dict:
 
     if _marker_needed:
         try:
+            import torch as _torch_check
+            if getattr(_torch_check.cuda, "is_available", lambda: False)():
+                _torch_check.cuda.reset_peak_memory_stats()
+        except Exception:
+            pass
+
+        try:
             from marker.converters.pdf import PdfConverter  # type: ignore
             from marker.output import text_from_rendered  # type: ignore
             full_text_md = ""
@@ -1554,6 +1563,22 @@ def _parse_pdf(path: Path, use_easyocr: bool, force_ocr: bool) -> Dict:
         except Exception as e:
             _torch_empty_cache(logs, "falha do marker")
             _log_torch_runtime("marker:failure", logs)
+            # OOM explícito — loga peak memory para diagnóstico
+            oom_names = {"OutOfMemoryError", "RuntimeError"}
+            is_oom = type(e).__name__ in oom_names and ("memory" in str(e).lower() or "alloc" in str(e).lower())
+            if is_oom:
+                try:
+                    import torch as _t
+                    idx = _t.cuda.current_device()
+                    peak_alloc = round(_t.cuda.max_memory_allocated(idx) / 1024**3, 3)
+                    peak_resv = round(_t.cuda.max_memory_reserved(idx) / 1024**3, 3)
+                    free, total = _t.cuda.mem_get_info(idx)
+                    logs.append(
+                        f"marker:OOM — peak_alloc={peak_alloc}GB peak_resv={peak_resv}GB "
+                        f"free={round(free/1024**3,3)}GB total={round(total/1024**3,3)}GB"
+                    )
+                except Exception:
+                    pass
             logger.warning("marker falhou em %s: %s", filename, e)
             logs.append(f"marker: falhou ({e})")
 
