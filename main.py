@@ -61,15 +61,21 @@ os.environ.setdefault("MODEL_CACHE_DIR", MARKER_MODEL_DIR)
 # Batch sizes default mais conservadores para ROCm/HIP.
 # Surya costuma escalar demais por padrão em GPU (ex.: recognition 512 ~= ~20GB VRAM),
 # então baixamos o default sem impedir override explícito via env/deploy.
+# Marker batch sizes (repassados internamente, mas podem não chegar ao surya)
 os.environ.setdefault("RECOGNITION_BATCH_SIZE", os.getenv("MARKER_RECOGNITION_BATCH_SIZE_DEFAULT", "4"))
 os.environ.setdefault("DETECTOR_BATCH_SIZE", os.getenv("MARKER_DETECTOR_BATCH_SIZE_DEFAULT", "2"))
 
-# BATCH_MULTIPLIER=1: marker/surya usa esse valor para escalar batch sizes internamente.
-# Default é 2, o que dobra o consumo de VRAM. Forçar 1 reduz o pico sem perda de qualidade.
+# Surya tem settings.py próprio (Pydantic BaseSettings) com vars independentes.
+# Default de DETECTOR_BATCH_SIZE no surya é 36 (~440 MB/item = ~16 GB só no detector).
+# Esses valores precisam ser setados ANTES de qualquer import do surya/marker.
+os.environ.setdefault("LAYOUT_BATCH_SIZE", os.getenv("SURYA_LAYOUT_BATCH_SIZE_DEFAULT", "2"))
+os.environ.setdefault("TABLE_REC_BATCH_SIZE", os.getenv("SURYA_TABLE_REC_BATCH_SIZE_DEFAULT", "2"))
+os.environ.setdefault("ORDER_BATCH_SIZE", os.getenv("SURYA_ORDER_BATCH_SIZE_DEFAULT", "2"))
+
+# BATCH_MULTIPLIER=1: marker usa esse valor para escalar batch sizes internamente.
 os.environ.setdefault("BATCH_MULTIPLIER", os.getenv("MARKER_BATCH_MULTIPLIER_DEFAULT", "1"))
 
 # INFERENCE_RAM + VRAM_PER_TASK: informa ao marker quanto de VRAM está disponível.
-# VRAM_PER_TASK=16 garante que ele não tente rodar workers paralelos na GPU.
 os.environ.setdefault("INFERENCE_RAM", os.getenv("MARKER_INFERENCE_RAM_DEFAULT", "16"))
 os.environ.setdefault("VRAM_PER_TASK", os.getenv("MARKER_VRAM_PER_TASK_DEFAULT", "16"))
 
@@ -199,16 +205,30 @@ def _log_torch_runtime(label: str, logs: Optional[List[str]] = None) -> None:
 
 
 def _marker_runtime_settings() -> Dict[str, Optional[str]]:
-    return {
+    base = {
         "torch_device": os.environ.get("TORCH_DEVICE"),
         "recognition_batch_size": os.environ.get("RECOGNITION_BATCH_SIZE"),
         "detector_batch_size": os.environ.get("DETECTOR_BATCH_SIZE"),
+        "layout_batch_size": os.environ.get("LAYOUT_BATCH_SIZE"),
+        "table_rec_batch_size": os.environ.get("TABLE_REC_BATCH_SIZE"),
+        "order_batch_size": os.environ.get("ORDER_BATCH_SIZE"),
         "batch_multiplier": os.environ.get("BATCH_MULTIPLIER"),
         "inference_ram": os.environ.get("INFERENCE_RAM"),
         "vram_per_task": os.environ.get("VRAM_PER_TASK"),
         "pytorch_cuda_alloc_conf": os.environ.get("PYTORCH_CUDA_ALLOC_CONF"),
         "model_cache_dir": os.environ.get("MODEL_CACHE_DIR"),
     }
+    # loga os valores efetivos do surya para confirmar que chegaram
+    try:
+        from surya.settings import settings as _surya  # type: ignore
+        base["surya_detector_batch"] = str(getattr(_surya, "DETECTOR_BATCH_SIZE", "N/A"))
+        base["surya_recognition_batch"] = str(getattr(_surya, "RECOGNITION_BATCH_SIZE", "N/A"))
+        base["surya_layout_batch"] = str(getattr(_surya, "LAYOUT_BATCH_SIZE", "N/A"))
+        base["surya_order_batch"] = str(getattr(_surya, "ORDER_BATCH_SIZE", "N/A"))
+        base["surya_table_rec_batch"] = str(getattr(_surya, "TABLE_REC_BATCH_SIZE", "N/A"))
+    except Exception:
+        pass
+    return base
 
 
 def _log_marker_runtime_settings(logs: Optional[List[str]] = None) -> None:
