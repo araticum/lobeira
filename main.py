@@ -61,8 +61,8 @@ os.environ.setdefault("MIOPEN_FIND_MODE", "FAST")
 # gfx1101 (RX 7800 XT) não tem suporte nativo hipBLASLt — forçar rocBLAS evita alocações extras
 os.environ.setdefault("TORCH_BLAS_PREFER_HIPBLASLT", "0")
 
-# Desabilita o caching allocator do PyTorch — aloca direto no HIP, elimina fragmentação
-os.environ.setdefault("PYTORCH_NO_CUDA_MEMORY_CACHING", "1")
+# PYTORCH_NO_CUDA_MEMORY_CACHING desabilitado — cega os memory stats e não resolve o OOM
+# os.environ.setdefault("PYTORCH_NO_CUDA_MEMORY_CACHING", "1")
 
 # Marker / Surya usam MODEL_CACHE_DIR para persistir modelos (~1-2 GB)
 # Deve ser definido ANTES da primeira importação de surya/marker
