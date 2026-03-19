@@ -114,14 +114,6 @@ def _get_docling_converter():
             pipeline_options = PdfPipelineOptions()
             pipeline_options.do_ocr = False
 
-            try:
-                from docling.datamodel.pipeline_options import AcceleratorOptions, AcceleratorDevice  # type: ignore
-                pipeline_options.accelerator_options = AcceleratorOptions(
-                    num_threads=4, device=AcceleratorDevice.CPU
-                )
-            except Exception as _acc_err:
-                logger.debug("docling: AcceleratorOptions indisponível: %s", _acc_err)
-
             _docling_converter = DocumentConverter(
                 format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)}
             )
