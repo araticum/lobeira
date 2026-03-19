@@ -1329,14 +1329,28 @@ def _parse_pdf(path: Path, use_easyocr: bool, force_ocr: bool) -> Dict:
                 "--method", "auto",
                 "--lang", "en",
             ]
-            _result = _sp.run(
+            import subprocess as _subprocess
+            _proc = _subprocess.Popen(
                 _cmd,
-                capture_output=True,
+                stdout=_subprocess.PIPE,
+                stderr=_subprocess.STDOUT,
                 text=True,
-                timeout=300,
             )
-            if _result.returncode != 0:
-                raise RuntimeError(f"returncode={_result.returncode}: {_result.stderr[:400]}")
+            _stdout_lines: list = []
+            assert _proc.stdout is not None
+            for _line in _proc.stdout:
+                _line = _line.rstrip()
+                if _line:
+                    logs.append(f"mineru|stdout: {_line[:300]}")
+                    _stdout_lines.append(_line)
+            try:
+                _returncode = _proc.wait(timeout=300)
+            except _subprocess.TimeoutExpired:
+                _proc.kill()
+                raise RuntimeError("timeout após 300s")
+            if _returncode != 0:
+                _tail = "\n".join(_stdout_lines[-5:])
+                raise RuntimeError(f"returncode={_returncode}: {_tail[:400]}")
             _md_files = list(_out_dir.rglob("*.md"))
             _mineru_raw = "\n".join(f.read_text(errors="replace") for f in _md_files)
 
