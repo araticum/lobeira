@@ -7,7 +7,9 @@ User=pedro
 Environment=HSA_OVERRIDE_GFX_VERSION=11.0.0
 Environment=PYTORCH_HIP_ALLOC_CONF=expandable_segments:True
 Environment=VLLM_TARGET_DEVICE=rocm
+Environment=VLLM_USE_TRITON_FLASH_ATTN=0
 Environment=ROCM_PATH=/opt/rocm
+Environment=HIP_VISIBLE_DEVICES=0
 ExecStart=/home/pedro/Lobeira/.venv/bin/vllm serve PaddlePaddle/PaddleOCR-VL-1.5 \
   --dtype float16 \
   --device rocm \

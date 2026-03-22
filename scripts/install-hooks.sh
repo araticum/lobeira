@@ -16,14 +16,16 @@ else
   echo "  ✓  .venv já existe"
 fi
 
-echo "📦 Instalando dependências (PyTorch ROCm primeiro)..."
-# Instala torch com ROCm antes das outras deps — evita que pip puxe a wheel CUDA
-"$REPO_ROOT/.venv/bin/pip" install -q \
-  torch torchvision torchaudio \
-  --index-url https://download.pytorch.org/whl/rocm6.2.4
-"$REPO_ROOT/.venv/bin/pip" install -q -r "$REPO_ROOT/requirements.txt" \
-  --extra-index-url https://download.pytorch.org/whl/rocm6.2.4
-echo "  ✅ dependências instaladas (ROCm)"
+echo "📦 Instalando dependências base (sem vLLM)..."
+# Mantém a app principal separada do stack do vLLM.
+# O vLLM em ROCm deve ser instalado manualmente com wheel ROCm específica ou build from source;
+# `pip install vllm` genérico tende a puxar a build errada (CUDA/PyPI) e quebra no import.
+"$REPO_ROOT/.venv/bin/pip" install -q --upgrade pip wheel setuptools
+"$REPO_ROOT/.venv/bin/pip" install -q -r "$REPO_ROOT/requirements.txt"
+echo "  ✅ dependências base instaladas"
+
+echo "ℹ️  vLLM ROCm não é instalado automaticamente por este script."
+echo "   Rode os comandos manuais documentados para instalar a build ROCm correta."
 
 echo "⚙️  Configurando git hooks via core.hooksPath..."
 git -C "$REPO_ROOT" config core.hooksPath scripts
