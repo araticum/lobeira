@@ -21,6 +21,18 @@ do
   fi
 done
 
+echo "🔧 [post-merge] Atualizando serviços systemd..."
+if [ -f "$REPO_ROOT/lobeira.service" ]; then
+  sudo cp "$REPO_ROOT/lobeira.service" /etc/systemd/system/lobeira.service
+  sudo systemctl daemon-reload
+  echo "  ✅ lobeira.service atualizado"
+fi
+if [ -f "$REPO_ROOT/vl-ocr.service" ]; then
+  sudo cp "$REPO_ROOT/vl-ocr.service" /etc/systemd/system/vl-ocr.service
+  sudo systemctl daemon-reload
+  echo "  ✅ vl-ocr.service atualizado"
+fi
+
 echo "📦 [post-merge] Atualizando dependências..."
 if [ -f ".venv/bin/pip" ]; then
   .venv/bin/pip install -q -r requirements.txt
