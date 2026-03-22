@@ -34,7 +34,7 @@ from zip_recursive import ZipExtractionLimits, extract_zip_recursive, write_extr
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 PARSER_MODE = os.getenv("PARSER_MODE", "balanced").strip().lower()
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", "1" if PARSER_MODE == "precision_first" else "2"))
-STORAGE_ROOT = Path(os.getenv("STORAGE_ROOT", "/app/storage"))
+STORAGE_ROOT = Path(os.getenv("STORAGE_ROOT", str(Path(__file__).parent / "storage")))
 JOBS_DB_PATH = STORAGE_ROOT / "jobs.sqlite3"
 
 # Fallback chain thresholds:
