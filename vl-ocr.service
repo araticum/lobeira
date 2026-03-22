@@ -8,6 +8,7 @@ Environment=HSA_OVERRIDE_GFX_VERSION=11.0.0
 Environment=PYTORCH_HIP_ALLOC_CONF=expandable_segments:True
 ExecStart=/home/pedro/Lobeira/.venv/bin/vllm serve PaddlePaddle/PaddleOCR-VL-1.5 \
   --dtype float16 \
+  --device rocm \
   --gpu-memory-utilization 0.85 \
   --max-num-batched-tokens 8192 \
   --port 8100 \
