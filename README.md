@@ -138,16 +138,23 @@ O PaddleOCR-VL-1.5 roda como servidor vLLM separado (ver `vl-ocr.service`). Se o
 
 ## Setup do PaddleOCR-VL-1.5 (servidor vLLM)
 
-> ⚠️ Em AMD/ROCm, **não** use `pip install vllm` genérico. A documentação oficial do vLLM indica que, para ROCm, não há wheel pronta equivalente ao fluxo CUDA em várias versões e o caminho seguro é usar imagem oficial/prebuilt própria ou **build from source**. Misturar PyTorch ROCm manual + wheel genérica do PyPI costuma quebrar no import de `vllm._C`.
+> ℹ️ A partir do vLLM v0.14.0 (jan/2026), wheels ROCm pré-compiladas estão disponíveis em `https://wheels.vllm.ai/rocm/`. **Não use `pip install vllm` sem o extra-index** — pega wheel CUDA por padrão.
 
 ```bash
-# Variáveis de ambiente permanentes (~/.bashrc ou /etc/environment)
-export HSA_OVERRIDE_GFX_VERSION=11.0.0
-export PYTORCH_HIP_ALLOC_CONF=expandable_segments:True
-export VLLM_TARGET_DEVICE=rocm
-export VLLM_USE_TRITON_FLASH_ATTN=0
+# 1. PyTorch ROCm (instalar antes do vLLM)
+.venv/bin/pip install torch torchvision torchaudio \
+  --index-url https://download.pytorch.org/whl/rocm6.2.4
 
-# Instalar e iniciar o serviço systemd
+# Verificar: deve mostrar hip != None
+.venv/bin/python3 -c "import torch; print(torch.__version__, '| hip:', torch.version.hip)"
+
+# 2. vLLM via índice ROCm oficial
+.venv/bin/pip install vllm --extra-index-url https://wheels.vllm.ai/rocm/
+
+# 3. Verificar
+.venv/bin/python3 -c "import vllm; import vllm._C; print('vLLM OK:', vllm.__version__)"
+
+# 4. Instalar e iniciar o serviço systemd
 sudo cp vl-ocr.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable vl-ocr
