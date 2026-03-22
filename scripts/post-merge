@@ -1,34 +1,42 @@
 #!/bin/bash
-# Git hook: executado automaticamente após `git pull` (fast-forward merge).
-# Reinicia os serviços da Lobeira e do vLLM se estiverem instalados via systemd.
+# Executado automaticamente pelo git após todo `git pull`.
+# Cuida de: env vars, dependências e restart dos serviços.
 
 set -e
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
-
-echo "🔄 [post-merge] Atualizando dependências..."
 cd "$REPO_ROOT"
 
+echo "🔧 [post-merge] Garantindo variáveis de ambiente..."
+for VAR in \
+  "HSA_OVERRIDE_GFX_VERSION=11.0.0" \
+  "PYTORCH_HIP_ALLOC_CONF=expandable_segments:True"
+do
+  KEY="${VAR%%=*}"
+  if ! grep -q "^$KEY=" /etc/environment 2>/dev/null; then
+    echo "$VAR" | sudo tee -a /etc/environment > /dev/null
+    echo "  ✅ $VAR adicionado ao /etc/environment"
+  else
+    echo "  ✓  $KEY já configurado"
+  fi
+done
+
+echo "📦 [post-merge] Atualizando dependências..."
 if [ -f ".venv/bin/pip" ]; then
   .venv/bin/pip install -q -r requirements.txt
 fi
 
 echo "🔁 [post-merge] Reiniciando serviços..."
-
-# Lobeira
 if systemctl is-active --quiet lobeira 2>/dev/null; then
-  sudo systemctl restart lobeira
-  echo "  ✅ lobeira reiniciada"
+  sudo systemctl restart lobeira && echo "  ✅ lobeira"
 else
-  echo "  ⚠️  lobeira não está rodando como serviço — ignorando"
+  echo "  ⚠️  lobeira não está ativa — ignorando"
 fi
 
-# vLLM PaddleOCR (só reinicia se já estava ativo, não sobe do zero)
 if systemctl is-active --quiet vl-ocr 2>/dev/null; then
-  sudo systemctl restart vl-ocr
-  echo "  ✅ vl-ocr reiniciado"
+  sudo systemctl restart vl-ocr && echo "  ✅ vl-ocr"
 else
-  echo "  ⚠️  vl-ocr não está ativo — ignorando"
+  echo "  ⚠️  vl-ocr não está ativa — ignorando"
 fi
 
-echo "✅ [post-merge] Concluído."
+echo "✅ [post-merge] Pronto."
