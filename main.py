@@ -853,6 +853,50 @@ def get_recent_system_logs(
     )
 
 
+@app.get("/logs/services")
+def get_services_logs(
+    limit: int = Query(default=50, ge=1, le=500),
+    since: Optional[str] = Query(default="1 hour ago"),
+):
+    """Retorna status e logs recentes de todos os serviços da Lobeira (lobeira, vl-ocr)."""
+    services = ["lobeira", "vl-ocr"]
+    result = {}
+    for svc in services:
+        # Status via systemctl
+        status_proc = subprocess.run(
+            ["systemctl", "is-active", svc],
+            capture_output=True, text=True
+        )
+        active = status_proc.stdout.strip()
+
+        # Logs via journalctl
+        args = ["journalctl", "--no-pager", "-o", "json", "-n", str(limit), "-u", svc]
+        if since:
+            args += ["--since", since]
+        try:
+            log_proc = subprocess.run(args, capture_output=True, text=True, timeout=10)
+            entries = []
+            for line in log_proc.stdout.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    raw = json.loads(line)
+                    entries.append({
+                        "ts": raw.get("__REALTIME_TIMESTAMP", ""),
+                        "priority": raw.get("PRIORITY", ""),
+                        "message": _stringify_system_log_message(
+                            raw.get("MESSAGE") or raw.get("message") or ""
+                        ),
+                    })
+                except Exception:
+                    entries.append({"ts": "", "priority": "", "message": line})
+            result[svc] = {"active": active, "count": len(entries), "logs": entries}
+        except Exception as exc:
+            result[svc] = {"active": active, "count": 0, "logs": [], "error": str(exc)}
+    return result
+
+
 @app.get("/storage/{tender_id}")
 def list_storage(tender_id: str):
     target_dir = STORAGE_ROOT / tender_id
