@@ -21,8 +21,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Deque, Dict, Iterable, List, Optional
 
+import boto3
 import httpx
 import magic
+from botocore.client import Config
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
 from pydantic import BaseModel
 
@@ -53,6 +55,10 @@ PADDLE_OCR_TIMEOUT = int(os.getenv("PADDLE_OCR_TIMEOUT", "120"))
 PADDLE_OCR_GPU_UTIL = float(os.getenv("PADDLE_OCR_GPU_UTIL", "0.85"))
 PADDLE_OCR_IMAGE_DPI = int(os.getenv("PADDLE_OCR_IMAGE_DPI", "200"))
 REVIEW_ROOT = STORAGE_ROOT / "review"
+SARGACO_ENDPOINT = os.getenv("SARGACO_ENDPOINT", "http://10.0.0.10:8333").rstrip("/")
+SARGACO_ACCESS_KEY = os.getenv("SARGACO_ACCESS_KEY", "monstro")
+SARGACO_SECRET_KEY = os.getenv("SARGACO_SECRET_KEY", "monstro_seaweed_2026")
+SARGACO_BUCKET = os.getenv("SARGACO_BUCKET", "monstro")
 
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
 logger = logging.getLogger("lobeira")
@@ -445,6 +451,7 @@ class DocumentInput(BaseModel):
     filename: str
     url: Optional[str] = None
     path: Optional[str] = None
+    storage_key: Optional[str] = None
 
 
 class ParseOptions(BaseModel):
@@ -952,6 +959,24 @@ async def delete_storage(tender_id: str):
 
 
 
+def _get_sargaco_s3_client():
+    return boto3.client(
+        "s3",
+        endpoint_url=SARGACO_ENDPOINT,
+        aws_access_key_id=SARGACO_ACCESS_KEY,
+        aws_secret_access_key=SARGACO_SECRET_KEY,
+        region_name="us-east-1",
+        config=Config(signature_version="s3v4"),
+    )
+
+
+def _download_from_sargaco(storage_key: str, dest_path: Path) -> Path:
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    response = _get_sargaco_s3_client().get_object(Bucket=SARGACO_BUCKET, Key=storage_key)
+    dest_path.write_bytes(response["Body"].read())
+    return dest_path
+
+
 def _load_manifest_documents(req: ParseRequest) -> List[DocumentInput]:
     if req.documents:
         return req.documents
@@ -961,15 +986,21 @@ def _load_manifest_documents(req: ParseRequest) -> List[DocumentInput]:
     resp.raise_for_status()
     manifest = resp.json()
     docs: List[DocumentInput] = []
+    raw_dir = STORAGE_ROOT / req.tender_id / "raw"
     for item in manifest.get("prepared_files") or []:
         if not isinstance(item, dict):
             continue
         url = item.get("url")
-        path = item.get("path")
-        filename = Path(str(item.get("filename") or item.get("storage_key") or "documento")).name
-        if not url and not path:
+        storage_key = item.get("storage_key")
+        filename = Path(str(item.get("filename") or storage_key or "documento")).name
+        if storage_key:
+            local_path = raw_dir / filename
+            _download_from_sargaco(str(storage_key), local_path)
+            docs.append(DocumentInput(filename=filename, path=str(local_path), storage_key=str(storage_key)))
             continue
-        docs.append(DocumentInput(filename=filename, url=url, path=path))
+        if not url:
+            continue
+        docs.append(DocumentInput(filename=filename, url=url, storage_key=str(storage_key) if storage_key else None))
     return docs
 
 
@@ -1197,11 +1228,17 @@ async def _handle_document(doc: DocumentInput, tmpdir: Path, use_easyocr: bool, 
     """Download + decompress + parse one document. Returns list of DocumentResult dicts.
     use_easyocr mantido por compatibilidade de assinatura; sem efeito."""
     safe_name = Path(doc.filename).name or f"doc_{uuid.uuid4().hex}"
-    dest = tmpdir / safe_name
-    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-        resp = await client.get(doc.url)
-        resp.raise_for_status()
-    dest.write_bytes(resp.content)
+    existing_path = Path(doc.path) if doc.path else None
+    if existing_path and existing_path.exists():
+        dest = existing_path
+    else:
+        dest = tmpdir / safe_name
+        if not doc.url:
+            raise ValueError(f"Documento sem origem baixável: {doc.filename}")
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+            resp = await client.get(doc.url)
+            resp.raise_for_status()
+        dest.write_bytes(resp.content)
 
     mime = magic.from_file(str(dest), mime=True)
     logger.debug("%s → mime=%s", doc.filename, mime)
