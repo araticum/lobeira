@@ -1,22 +1,29 @@
 [Unit]
-Description=PaddleOCR-VL-1.5 vLLM Server
-After=network.target
+Description=PaddleOCR-VL-1.5 vLLM Server (Docker)
+After=network.target docker.service
+Requires=docker.service
 
 [Service]
 User=pedro
 Environment=HSA_OVERRIDE_GFX_VERSION=11.0.0
-Environment=PYTORCH_HIP_ALLOC_CONF=expandable_segments:True
-Environment=VLLM_TARGET_DEVICE=rocm
-Environment=VLLM_USE_TRITON_FLASH_ATTN=0
-Environment=ROCM_PATH=/opt/rocm
-Environment=HIP_VISIBLE_DEVICES=0
-ExecStart=/home/pedro/Lobeira/.venv/bin/vllm serve PaddlePaddle/PaddleOCR-VL-1.5 \
-  --dtype float16 \
-  --device rocm \
-  --gpu-memory-utilization 0.85 \
-  --max-num-batched-tokens 8192 \
-  --port 8100 \
-  --host 127.0.0.1
+ExecStartPre=-/usr/bin/docker rm -f vl-ocr
+ExecStart=/usr/bin/docker run --rm \
+  --name vl-ocr \
+  --device /dev/kfd \
+  --device /dev/dri \
+  --group-add video \
+  -p 127.0.0.1:8100:8000 \
+  -e HSA_OVERRIDE_GFX_VERSION=11.0.0 \
+  -e VLLM_USE_TRITON_FLASH_ATTN=0 \
+  -v /home/pedro/.cache/huggingface:/root/.cache/huggingface \
+  rocm/vllm \
+  vllm serve PaddlePaddle/PaddleOCR-VL-1.5 \
+    --dtype float16 \
+    --device rocm \
+    --gpu-memory-utilization 0.85 \
+    --port 8000 \
+    --host 0.0.0.0
+ExecStop=/usr/bin/docker stop vl-ocr
 Restart=on-failure
 RestartSec=10
 
