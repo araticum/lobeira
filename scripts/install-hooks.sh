@@ -16,9 +16,14 @@ else
   echo "  ✓  .venv já existe"
 fi
 
-echo "📦 Instalando dependências..."
-"$REPO_ROOT/.venv/bin/pip" install -q -r "$REPO_ROOT/requirements.txt"
-echo "  ✅ dependências instaladas"
+echo "📦 Instalando dependências (PyTorch ROCm primeiro)..."
+# Instala torch com ROCm antes das outras deps — evita que pip puxe a wheel CUDA
+"$REPO_ROOT/.venv/bin/pip" install -q \
+  torch torchvision torchaudio \
+  --index-url https://download.pytorch.org/whl/rocm6.2.4
+"$REPO_ROOT/.venv/bin/pip" install -q -r "$REPO_ROOT/requirements.txt" \
+  --extra-index-url https://download.pytorch.org/whl/rocm6.2.4
+echo "  ✅ dependências instaladas (ROCm)"
 
 echo "⚙️  Configurando git hooks via core.hooksPath..."
 git -C "$REPO_ROOT" config core.hooksPath scripts
