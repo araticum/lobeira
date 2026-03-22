@@ -219,7 +219,7 @@ class LogsEndpointsTests(unittest.TestCase):
                 "__REALTIME_TIMESTAMP": "1710000001000000",
                 "PRIORITY": "4",
                 "SYSLOG_IDENTIFIER": "parser-monstro",
-                "MESSAGE": {"event": "marker", "detail": "HIP OOM trying to allocate"},
+                "MESSAGE": {"event": "paddleocr", "detail": "HIP OOM trying to allocate"},
             }),
         ])
         original_run = self.main.subprocess.run
@@ -236,7 +236,7 @@ class LogsEndpointsTests(unittest.TestCase):
 
     def test_get_recent_system_logs_file_fallback_respects_contains_filter(self):
         system_log_path = Path(self.tmpdir) / "parser-system.log"
-        system_log_path.write_text("GET /queue 200\nMarker loaded successfully\nROCm fallback enabled\n", encoding="utf-8")
+        system_log_path.write_text("GET /queue 200\nPaddleOCR loaded successfully\nROCm fallback enabled\n", encoding="utf-8")
         self.main.SYSTEM_LOG_FILE_PATH = str(system_log_path)
 
         original_run = self.main.subprocess.run
@@ -249,10 +249,6 @@ class LogsEndpointsTests(unittest.TestCase):
         self.assertEqual(payload["backend"], "file")
         self.assertEqual(payload["count"], 1)
         self.assertEqual(payload["items"][0]["message"], "ROCm fallback enabled")
-
-    def test_marker_runtime_defaults_are_conservative(self):
-        self.assertEqual(os.environ.get("RECOGNITION_BATCH_SIZE"), "64")
-        self.assertEqual(os.environ.get("DETECTOR_BATCH_SIZE"), "8")
 
     def test_torch_empty_cache_runs_gc_and_cuda_cleanup(self):
         calls = []

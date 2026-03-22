@@ -1,39 +1,41 @@
 # Lobeira — Serviço de Extração de Documentos
 
-Container isolado que extrai texto de documentos de licitação (PDF, DOCX, HTML, imagens, ZIP, RAR, 7z) e expõe uma API REST na porta 7000.
+Serviço isolado que extrai texto de documentos de licitação (PDF, DOCX, HTML, imagens, ZIP, RAR, 7z) e expõe uma API REST na porta 7001.
 
 ## Requisitos
 
-- Docker Desktop for Windows (ou Docker Engine no Linux/Mac)
-- docker-compose v2+
+- Python 3.11+
+- Tesseract OCR instalado (`tesseract-ocr tesseract-ocr-por`)
+- GPU AMD com ROCm 7.2+ para o PaddleOCR-VL-1.5 (opcional, tem fallback CPU)
+- vLLM com backend ROCm para o servidor PaddleOCR-VL-1.5
 
-## Como buildar e rodar (Windows)
+## Como rodar
 
 ```bash
-# Na pasta parser-service/
-docker-compose up --build
+cd ~/Lobeira
+source .venv/bin/activate
+uvicorn main:app --host 0.0.0.0 --port 7001
 ```
 
-O serviço ficará disponível em `http://localhost:7000`.
+O serviço ficará disponível em `http://localhost:7001`.
 
 ## Testar com curl
 
 ### Health check
 ```bash
-curl http://localhost:7000/health
-# {"status":"ok","tesseract":true,"easyocr_enabled":false}
+curl http://localhost:7001/health
+# {"status":"ok","tesseract":true,...}
 ```
 
 ### Enviar job de parsing (assíncrono)
 ```bash
-curl -X POST http://localhost:7000/parse \
+curl -X POST http://localhost:7001/parse \
   -H "Content-Type: application/json" \
   -d '{
     "tender_id": "abc-123",
     "documents": [
       {"url": "https://exemplo.gov.br/edital.pdf", "filename": "edital.pdf"}
-    ],
-    "options": {"enable_easyocr": false}
+    ]
   }'
 # Retorna: {"tender_id":"abc-123","status":"pending","job_id":"<uuid>", ...}
 ```
@@ -76,25 +78,22 @@ environment:
 
 E adicione o serviço `parser` ao mesmo compose (ou use a rede Docker interna).
 
-## EasyOCR
-
-> ⚠️ EasyOCR está temporariamente desabilitado no runtime ROCm deste serviço por instabilidade com meta tensors/device move. Mesmo que `ENABLE_EASYOCR=true` seja enviado, o parser ignora a flag e mantém o fallback OCR em Tesseract.
-
 ## Variáveis de ambiente
 
 | Variável | Padrão | Descrição |
 |---|---|---|
-| `ENABLE_EASYOCR` | `false` | Mantida apenas por compatibilidade; o runtime atual ignora a flag e desabilita EasyOCR |
-| `PYTORCH_CUDA_ALLOC_CONF` | `expandable_segments:True` | Default conservador para reduzir fragmentação/OOM em ROCm |
-| `HIPBLAS_WORKSPACE_CONFIG` | `:4096:8` | Limita workspace hipBLAS por padrão sem sobrescrever override explícito |
-| `RECOGNITION_BATCH_SIZE` | `64` | Default conservador para Surya/Marker em GPU; pode ser sobrescrito no deploy |
-| `DETECTOR_BATCH_SIZE` | `8` | Default conservador para Surya/Marker em GPU; pode ser sobrescrito no deploy |
-| `MAX_WORKERS` | `2` | Jobs simultâneos |
+| `PADDLE_OCR_URL` | `http://127.0.0.1:8100` | Endpoint do servidor vLLM com PaddleOCR-VL-1.5 |
+| `PADDLE_OCR_MODEL` | `PaddlePaddle/PaddleOCR-VL-1.5` | Nome do modelo servido pelo vLLM |
+| `PADDLE_OCR_TIMEOUT` | `120` | Timeout em segundos por página |
+| `PADDLE_OCR_GPU_UTIL` | `0.85` | GPU memory utilization do vLLM |
+| `PYTORCH_HIP_ALLOC_CONF` | `expandable_segments:True` | Reduz fragmentação/OOM em ROCm |
+| `HSA_OVERRIDE_GFX_VERSION` | `11.0.0` | Necessário para AMD RX 7800 XT (gfx1101/RDNA3) |
+| `MAX_WORKERS` | `1` | Jobs simultâneos |
 | `LOG_LEVEL` | `INFO` | Nível de log (DEBUG/INFO/WARNING) |
-| `STORAGE_ROOT` | `/app/storage` | Pasta de armazenamento temporário |
-| `PARSER_SYSTEMD_UNIT` | vazio | Unidade systemd para consultar com `journalctl -u`; se vazio tenta `INVOCATION_ID` e depois `SYSLOG_IDENTIFIER=parser-monstro` |
-| `PARSER_SYSTEM_LOG_PATH` | vazio | Fallback opcional de arquivo de log local quando `journalctl` não estiver disponível/permitido |
-| `SYSTEM_LOG_HISTORY_LIMIT` | `500` | Tamanho do buffer em memória usado como último fallback para `/logs/system/recent` |
+| `STORAGE_ROOT` | `/app/storage` | Pasta de armazenamento; páginas problemáticas vão em `review/{job_id}/` |
+| `PARSER_SYSTEMD_UNIT` | vazio | Unidade systemd para `journalctl -u` |
+| `PARSER_SYSTEM_LOG_PATH` | vazio | Fallback de arquivo de log local |
+| `SYSTEM_LOG_HISTORY_LIMIT` | `500` | Buffer em memória para `/logs/system/recent` |
 
 ## Endpoints
 
@@ -123,12 +122,35 @@ Por padrão o endpoint remove linhas ruidosas de access log/health/queue/logs pa
 
 Em alguns deploys o processo do parser pode não ter permissão para ler o journal do host. Nesse caso o endpoint não quebra: ele retorna `warnings` explicando a falha e usa o fallback disponível. Para ter a visão mais completa, garanta que o serviço possa executar `journalctl` com acesso ao journal correspondente, ou configure `PARSER_SYSTEM_LOG_PATH`.
 
-## Nota sobre ROCm + Marker/Surya
+## Pipeline de extração
 
-O runtime continua **GPU-first**: não há downgrade silencioso para CPU. Para reduzir a chance de OOM depois do docling, o serviço agora:
+```
+1. PyMuPDF          → PDF nativo com texto?       → ✅ suficiente (score ≥ 0.9) → para
+   ↓ não
+2. PaddleOCR-VL-1.5 → PDF escaneado/complexo (GPU)→ ✅ suficiente (score ≥ 0.82) → para
+   ↓ timeout / OOM / confiança baixa
+3. Tesseract `por`  → CPU, sem GPU               → ✅ suficiente (score ≥ 0.5) → para
+   ↓ resultado vazio ou abaixo do threshold
+4. Falha registrada + páginas problemáticas salvas em STORAGE_ROOT/review/{job_id}/
+```
 
-- aplica defaults de batch mais conservadores para Surya (`RECOGNITION_BATCH_SIZE=64`, `DETECTOR_BATCH_SIZE=8`) quando o deploy não define overrides;
-- faz `gc.collect()` + `torch.cuda.empty_cache()` nas fronteiras das etapas GPU;
-- registra snapshots de memória/config antes/depois/falha do Marker.
+O PaddleOCR-VL-1.5 roda como servidor vLLM separado (ver `vl-ocr.service`). Se o servidor não estiver disponível, o pipeline cai automaticamente para Tesseract.
 
-Isso melhora estabilidade, mas não elimina totalmente OOM em PDFs grandes/complexos no stack atual ROCm + marker/surya. Se ainda houver `HIP out of memory`, o próximo passo provável é ajuste adicional de batch/config por deploy ou mudança de versão/configuração upstream da biblioteca.
+## Setup do PaddleOCR-VL-1.5 (servidor vLLM)
+
+```bash
+# Variáveis de ambiente permanentes (~/.bashrc ou /etc/environment)
+export HSA_OVERRIDE_GFX_VERSION=11.0.0
+export PYTORCH_HIP_ALLOC_CONF=expandable_segments:True
+
+# Instalar vLLM com ROCm
+pip install vllm --extra-index-url https://download.pytorch.org/whl/rocm6.2
+
+# Instalar e iniciar o serviço systemd
+sudo cp vl-ocr.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable vl-ocr
+sudo systemctl start vl-ocr
+```
+
+O serviço vLLM ficará em `http://127.0.0.1:8100`.
