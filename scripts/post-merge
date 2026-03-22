@@ -1,0 +1,34 @@
+#!/bin/bash
+# Git hook: executado automaticamente após `git pull` (fast-forward merge).
+# Reinicia os serviços da Lobeira e do vLLM se estiverem instalados via systemd.
+
+set -e
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+
+echo "🔄 [post-merge] Atualizando dependências..."
+cd "$REPO_ROOT"
+
+if [ -f ".venv/bin/pip" ]; then
+  .venv/bin/pip install -q -r requirements.txt
+fi
+
+echo "🔁 [post-merge] Reiniciando serviços..."
+
+# Lobeira
+if systemctl is-active --quiet lobeira 2>/dev/null; then
+  sudo systemctl restart lobeira
+  echo "  ✅ lobeira reiniciada"
+else
+  echo "  ⚠️  lobeira não está rodando como serviço — ignorando"
+fi
+
+# vLLM PaddleOCR (só reinicia se já estava ativo, não sobe do zero)
+if systemctl is-active --quiet vl-ocr 2>/dev/null; then
+  sudo systemctl restart vl-ocr
+  echo "  ✅ vl-ocr reiniciado"
+else
+  echo "  ⚠️  vl-ocr não está ativo — ignorando"
+fi
+
+echo "✅ [post-merge] Concluído."
