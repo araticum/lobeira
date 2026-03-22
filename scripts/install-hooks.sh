@@ -14,17 +14,10 @@ chmod +x "$REPO_ROOT/scripts/post-merge"
 echo "  ✅ Hooks ativos em scripts/ (sem cópia necessária)"
 
 echo "📦 Instalando serviços systemd..."
-sudo cp "$REPO_ROOT/lobeira.service"         /etc/systemd/system/lobeira.service
-sudo cp "$REPO_ROOT/vl-ocr.service"          /etc/systemd/system/vl-ocr.service
-sudo cp "$REPO_ROOT/scripts/lobeira-updater.service" /etc/systemd/system/lobeira-updater.service
-sudo cp "$REPO_ROOT/scripts/lobeira-updater.timer"   /etc/systemd/system/lobeira-updater.timer
+sudo cp "$REPO_ROOT/lobeira.service" /etc/systemd/system/lobeira.service
+sudo cp "$REPO_ROOT/vl-ocr.service"  /etc/systemd/system/vl-ocr.service
 sudo systemctl daemon-reload
-
-echo "🔁 Habilitando auto-update (timer a cada 5 min)..."
-sudo systemctl enable --now lobeira-updater.timer
-echo "  ✅ Timer ativo"
 
 echo ""
 echo "✅ Setup concluído. A partir de agora:"
-echo "   • git pull → reinicia automaticamente via hook"
-echo "   • timer    → puxa atualizações a cada 5 minutos sozinho"
+echo "   • git pull → env vars + deps + restart automático via hook"
