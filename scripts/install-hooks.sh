@@ -8,6 +8,18 @@ set -e
 
 REPO_ROOT="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
 
+echo "🐍 Criando virtualenv..."
+if [ ! -f "$REPO_ROOT/.venv/bin/python" ]; then
+  python3 -m venv "$REPO_ROOT/.venv"
+  echo "  ✅ .venv criado"
+else
+  echo "  ✓  .venv já existe"
+fi
+
+echo "📦 Instalando dependências..."
+"$REPO_ROOT/.venv/bin/pip" install -q -r "$REPO_ROOT/requirements.txt"
+echo "  ✅ dependências instaladas"
+
 echo "⚙️  Configurando git hooks via core.hooksPath..."
 git -C "$REPO_ROOT" config core.hooksPath scripts
 chmod +x "$REPO_ROOT/scripts/post-merge"
