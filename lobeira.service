@@ -8,7 +8,7 @@ WorkingDirectory=/home/pedro/Lobeira
 Environment=HSA_OVERRIDE_GFX_VERSION=11.0.0
 Environment=PYTORCH_HIP_ALLOC_CONF=expandable_segments:True
 Environment=STORAGE_ROOT=/home/pedro/Lobeira/storage
-Environment=PADDLE_OCR_URL=http://127.0.0.1:8100
+Environment=PADDLE_OCR_URL=http://localhost:8100
 Environment=SARGACO_ENDPOINT=http://10.0.0.10:8333
 Environment=SARGACO_ACCESS_KEY=monstro
 Environment=SARGACO_SECRET_KEY=monstro_seaweed_2026
