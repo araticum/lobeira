@@ -1,0 +1,11 @@
+[Unit]
+Description=Lobeira — Auto-update via git pull
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=pedro
+WorkingDirectory=/home/pedro/Lobeira
+ExecStart=/home/pedro/Lobeira/scripts/auto-update.sh
+StandardOutput=journal
+StandardError=journal
