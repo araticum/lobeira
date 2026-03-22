@@ -38,15 +38,21 @@ STORAGE_ROOT = Path(os.getenv("STORAGE_ROOT", "/app/storage"))
 JOBS_DB_PATH = STORAGE_ROOT / "jobs.sqlite3"
 
 # Fallback chain thresholds:
-# 1. pymupdf  → se score >= 0.9, pronto
-# 2. docling  → se pymupdf < 0.9, tenta; se score >= 0.9, pronto
-# 3. mineru   → se docling < 0.9, tenta; se score >= 0.82, pronto
-# 4. tesseract → se mineru falhar ou score < 0.82
+# 1. pymupdf           → score >= 0.90, pronto
+# 2. paddleocr-vl-1.5  → score >= 0.82, pronto
+# 3. tesseract         → score >= 0.50, pronto
+# 4. abaixo disso      → registra falha + salva páginas para revisão manual
 PYMUPDF_QUALITY_THRESHOLD = float(os.getenv("PYMUPDF_QUALITY_THRESHOLD", "0.9"))
-DOCLING_QUALITY_THRESHOLD = float(os.getenv("DOCLING_QUALITY_THRESHOLD", "0.9"))
-MINERU_QUALITY_THRESHOLD = float(os.getenv("MINERU_QUALITY_THRESHOLD", "0.82"))
+PADDLE_OCR_QUALITY_THRESHOLD = float(os.getenv("PADDLE_OCR_QUALITY_THRESHOLD", "0.82"))
+TESSERACT_QUALITY_THRESHOLD = float(os.getenv("TESSERACT_QUALITY_THRESHOLD", "0.5"))
 MIN_CHARS_PER_PAGE_NATIVE = int(os.getenv("MIN_CHARS_PER_PAGE_NATIVE", "80"))
 CLEAN_OCR_NOISE = os.getenv("CLEAN_OCR_NOISE", "true").lower() == "true"
+PADDLE_OCR_URL = os.getenv("PADDLE_OCR_URL", "http://127.0.0.1:8100")
+PADDLE_OCR_MODEL = os.getenv("PADDLE_OCR_MODEL", "PaddlePaddle/PaddleOCR-VL-1.5")
+PADDLE_OCR_TIMEOUT = int(os.getenv("PADDLE_OCR_TIMEOUT", "120"))
+PADDLE_OCR_GPU_UTIL = float(os.getenv("PADDLE_OCR_GPU_UTIL", "0.85"))
+PADDLE_OCR_IMAGE_DPI = int(os.getenv("PADDLE_OCR_IMAGE_DPI", "200"))
+REVIEW_ROOT = STORAGE_ROOT / "review"
 
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
 logger = logging.getLogger("lobeira")
@@ -94,30 +100,104 @@ def _ensure_system_log_capture_handler() -> None:
 
 _ensure_system_log_capture_handler()
 
-_docling_converter = None
-_docling_converter_lock = None
 
+class PaddleOCRVLParser:
+    def __init__(self, base_url: str, model: str, timeout_s: int = 120, image_dpi: int = 200) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+        self.timeout_s = timeout_s
+        self.image_dpi = image_dpi
 
-def _get_docling_converter():
-    global _docling_converter, _docling_converter_lock
-    import threading as _threading
+    def parse_pdf(self, path: Path, review_dir: Optional[Path] = None) -> Dict[str, Any]:
+        import fitz
+        from openai import OpenAI
 
-    if _docling_converter_lock is None:
-        _docling_converter_lock = _threading.Lock()
+        review_dir = review_dir or REVIEW_ROOT / f"adhoc-{uuid.uuid4().hex}"
+        review_dir.mkdir(parents=True, exist_ok=True)
 
-    with _docling_converter_lock:
-        if _docling_converter is None:
-            from docling.datamodel.base_models import InputFormat  # type: ignore
-            from docling.datamodel.pipeline_options import PdfPipelineOptions  # type: ignore
-            from docling.document_converter import DocumentConverter, PdfFormatOption  # type: ignore
+        client = OpenAI(
+            base_url=f"{self.base_url}/v1",
+            api_key=os.getenv("PADDLE_OCR_API_KEY", "dummy"),
+            timeout=self.timeout_s,
+        )
+        doc = fitz.open(str(path))
+        parts: List[str] = []
+        logs: List[str] = []
+        failed_pages: List[int] = []
+        total_chars = 0
+        pages = doc.page_count
 
-            pipeline_options = PdfPipelineOptions()
-            pipeline_options.do_ocr = False
+        try:
+            for page_index in range(pages):
+                page_number = page_index + 1
+                page = doc.load_page(page_index)
+                pix = page.get_pixmap(dpi=self.image_dpi, alpha=False)
+                image_bytes = pix.tobytes("png")
+                image_b64 = base64.b64encode(image_bytes).decode("ascii")
+                page_review_path = review_dir / f"page-{page_number:04d}.png"
 
-            _docling_converter = DocumentConverter(
-                format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)}
-            )
-    return _docling_converter
+                try:
+                    response = client.chat.completions.create(
+                        model=self.model,
+                        temperature=0,
+                        messages=[
+                            {
+                                "role": "user",
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": (
+                                            "Extraia fielmente todo o texto visível desta página em português. "
+                                            "Mantenha a ordem de leitura, preserve números e pontuação, "
+                                            "não resuma e não invente conteúdo."
+                                        ),
+                                    },
+                                    {
+                                        "type": "image_url",
+                                        "image_url": {"url": f"data:image/png;base64,{image_b64}"},
+                                    },
+                                ],
+                            }
+                        ],
+                    )
+                    content = response.choices[0].message.content if response.choices else ""
+                    page_text = _normalize_text(content or "")
+                    char_count = len(page_text)
+                    total_chars += char_count
+                    if char_count == 0:
+                        failed_pages.append(page_number)
+                        page_review_path.write_bytes(image_bytes)
+                        logs.append(f"paddleocr_vl: página {page_number} vazia")
+                    else:
+                        parts.append(page_text)
+                        logs.append(f"paddleocr_vl: página {page_number} ok ({char_count} chars)")
+                except Exception as exc:
+                    failed_pages.append(page_number)
+                    page_review_path.write_bytes(image_bytes)
+                    message = str(exc)[:300]
+                    if "out of memory" in message.lower() or "oom" in message.lower():
+                        message = f"OOM: {message}"
+                    elif "timed out" in message.lower() or "timeout" in message.lower():
+                        message = f"timeout: {message}"
+                    else:
+                        message = f"erro: {message}"
+                    logs.append(f"paddleocr_vl: página {page_number} falhou ({message})")
+        finally:
+            doc.close()
+
+        text = "\n\n".join(parts).strip()
+        quality = _quality_score(text, pages) if text else 0.0
+        avg_chars_per_page = round(total_chars / max(1, pages), 2)
+        logs.append(f"paddleocr_vl: total={total_chars} chars, {pages}p, avg_chars_per_page={avg_chars_per_page}, score={quality:.2f}")
+        return {
+            "text": text,
+            "pages": pages,
+            "quality": quality,
+            "logs": logs,
+            "failed_pages": failed_pages,
+            "avg_chars_per_page": avg_chars_per_page,
+            "saved_review_dir": str(review_dir),
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -453,12 +533,12 @@ async def startup():
     await _restore_and_schedule_purges()
     logger.info(
         "Lobeira iniciado. mode=%s MAX_WORKERS=%d "
-        "thresholds: pymupdf=%.2f docling=%.2f mineru=%.2f",
+        "thresholds: pymupdf=%.2f paddleocr=%.2f tesseract=%.2f",
         PARSER_MODE,
         MAX_WORKERS,
         PYMUPDF_QUALITY_THRESHOLD,
-        DOCLING_QUALITY_THRESHOLD,
-        MINERU_QUALITY_THRESHOLD,
+        PADDLE_OCR_QUALITY_THRESHOLD,
+        TESSERACT_QUALITY_THRESHOLD,
     )
 
 
@@ -483,8 +563,14 @@ def health():
         "parser_mode": PARSER_MODE,
         "thresholds": {
             "pymupdf": PYMUPDF_QUALITY_THRESHOLD,
-            "docling": DOCLING_QUALITY_THRESHOLD,
-            "mineru": MINERU_QUALITY_THRESHOLD,
+            "paddleocr_vl": PADDLE_OCR_QUALITY_THRESHOLD,
+            "tesseract": TESSERACT_QUALITY_THRESHOLD,
+        },
+        "paddle_ocr": {
+            "url": PADDLE_OCR_URL,
+            "model": PADDLE_OCR_MODEL,
+            "timeout_s": PADDLE_OCR_TIMEOUT,
+            "gpu_util": PADDLE_OCR_GPU_UTIL,
         },
         "max_workers": queue["max_workers"],
         "slots_in_use": queue["slots_in_use"],
@@ -985,7 +1071,7 @@ def _process_job_sync(job_id: str, req: ParseRequest, documents: List[DocumentIn
             _append_job_log(job_id, f"[{datetime.now(timezone.utc).isoformat()}] iniciando documento {index}/{len(documents)}: {doc.filename}")
             logger.info("Job %s processando documento %s/%s: %s", job_id, index, len(documents), doc.filename)
             try:
-                results = asyncio.run(_handle_document(doc, target_dir, use_easyocr, force_ocr))
+                results = asyncio.run(_handle_document(doc, target_dir, use_easyocr, force_ocr, job_id=job_id))
                 doc_results.extend(results)
                 documents_done += 1
                 _replace_job_documents(job_id, doc_results)
@@ -1063,7 +1149,7 @@ def _process_job_sync(job_id: str, req: ParseRequest, documents: List[DocumentIn
         )
 
 
-async def _handle_document(doc: DocumentInput, tmpdir: Path, use_easyocr: bool, force_ocr: bool) -> List[Dict]:
+async def _handle_document(doc: DocumentInput, tmpdir: Path, use_easyocr: bool, force_ocr: bool, job_id: Optional[str] = None) -> List[Dict]:
     """Download + decompress + parse one document. Returns list of DocumentResult dicts.
     use_easyocr mantido por compatibilidade de assinatura; sem efeito."""
     safe_name = Path(doc.filename).name or f"doc_{uuid.uuid4().hex}"
@@ -1088,7 +1174,7 @@ async def _handle_document(doc: DocumentInput, tmpdir: Path, use_easyocr: bool, 
 
     results = []
     for fpath in files_to_parse:
-        result = _parse_file(fpath, use_easyocr, force_ocr)
+        result = _parse_file(fpath, use_easyocr, force_ocr, job_id=job_id)
         results.append(result)
     return results
 
@@ -1218,13 +1304,13 @@ async def _purge_tender_storage(tender_id: str) -> bool:
     return existed
 
 
-def _parse_file(path: Path, use_easyocr: bool, force_ocr: bool) -> Dict:
+def _parse_file(path: Path, use_easyocr: bool, force_ocr: bool, job_id: Optional[str] = None) -> Dict:
     """Parse a single file with fallback chain."""
     mime = magic.from_file(str(path), mime=True)
     filename = path.name
 
     if "pdf" in mime:
-        return _parse_pdf(path, use_easyocr, force_ocr)
+        return _parse_pdf(path, use_easyocr, force_ocr, job_id=job_id)
     elif "word" in mime or "officedocument" in mime or path.suffix.lower() in (".doc", ".docx"):
         return _parse_docx(path)
     elif "html" in mime or path.suffix.lower() in (".html", ".htm"):
@@ -1238,25 +1324,16 @@ def _parse_file(path: Path, use_easyocr: bool, force_ocr: bool) -> Dict:
         return _make_result(filename, mime, "unsupported", 0, 0.0, "", error=f"Tipo não suportado: {mime}")
 
 
-def _parse_pdf(path: Path, use_easyocr: bool, force_ocr: bool) -> Dict:
-    """Fallback chain: pymupdf → docling → mineru → tesseract.
-
-    Cada etapa só roda se a anterior ficou abaixo do threshold de qualidade:
-    - pymupdf  >= PYMUPDF_QUALITY_THRESHOLD  (0.9) → pronto
-    - docling  >= DOCLING_QUALITY_THRESHOLD  (0.9) → pronto
-    - mineru   >= MINERU_QUALITY_THRESHOLD   (0.82) → pronto
-    - tesseract → último recurso
-    """
+def _parse_pdf(path: Path, use_easyocr: bool, force_ocr: bool, job_id: Optional[str] = None) -> Dict:
+    """Fallback chain: pymupdf → paddleocr-vl → tesseract → revisão manual."""
     filename = path.name
     text = ""
     method = ""
     pages = 0
     quality = 0.0
     logs: List[str] = []
+    review_dir = REVIEW_ROOT / (job_id or uuid.uuid4().hex) / path.stem
 
-    # ------------------------------------------------------------------
-    # Step 1: pymupdf
-    # ------------------------------------------------------------------
     try:
         import fitz
         doc = fitz.open(str(path))
@@ -1270,7 +1347,6 @@ def _parse_pdf(path: Path, use_easyocr: bool, force_ocr: bool) -> Dict:
             quality = _quality_score(text, pages)
             chars_per_page = len(text) / max(1, pages)
             if chars_per_page < MIN_CHARS_PER_PAGE_NATIVE:
-                # texto existe mas escasso — tratar como fraco independente do score
                 quality = min(quality, PYMUPDF_QUALITY_THRESHOLD - 0.01)
             logs.append(f"pymupdf: {len(text)} chars, {pages}p, score={quality:.2f}")
         else:
@@ -1282,106 +1358,36 @@ def _parse_pdf(path: Path, use_easyocr: bool, force_ocr: bool) -> Dict:
         logs.append(f"pymupdf: suficiente (score={quality:.2f} >= {PYMUPDF_QUALITY_THRESHOLD}), parando chain")
         return _make_result(filename, "pdf_native", method, pages, quality, text, logs=logs)
 
-    # ------------------------------------------------------------------
-    # Step 2: docling
-    # ------------------------------------------------------------------
+    logs.append(f"paddleocr_vl: tentando (score atual={quality:.2f}, timeout={PADDLE_OCR_TIMEOUT}s/página)")
     try:
-        from docling.document_converter import DocumentConverter  # type: ignore
-        converter = _get_docling_converter()
-        result = converter.convert(str(path))
-        docling_raw = result.document.export_to_text() if result and result.document else ""
-        del result
-        docling_text = _normalize_text(docling_raw)
-        if docling_text:
-            docling_pages = pages or 1
-            docling_quality = _quality_score(docling_text, docling_pages)
-            logs.append(f"docling: {len(docling_text)} chars, {docling_pages}p, score={docling_quality:.2f}")
-            if docling_quality > quality:
-                text = docling_text
-                pages = docling_pages
-                quality = docling_quality
-                method = "docling"
+        paddle_result = PaddleOCRVLParser(
+            base_url=PADDLE_OCR_URL,
+            model=PADDLE_OCR_MODEL,
+            timeout_s=PADDLE_OCR_TIMEOUT,
+            image_dpi=PADDLE_OCR_IMAGE_DPI,
+        ).parse_pdf(path, review_dir=review_dir)
+        paddle_text = _normalize_text(paddle_result.get("text", ""))
+        paddle_pages = int(paddle_result.get("pages") or pages or 0)
+        paddle_quality = float(paddle_result.get("quality") or 0.0)
+        logs.extend(paddle_result.get("logs", []))
+        if paddle_text:
+            if force_ocr or paddle_quality >= quality:
+                text = paddle_text
+                pages = paddle_pages
+                quality = paddle_quality
+                method = "paddleocr_vl"
         else:
-            logs.append("docling: resultado vazio")
-    except ImportError:
-        logs.append("docling: não instalado — pulado")
+            logs.append("paddleocr_vl: resultado vazio")
     except Exception as e:
-        logs.append(f"docling: falhou ({str(e)[:200]})")
+        logs.append(f"paddleocr_vl: falhou ({str(e)[:300]})")
 
-    if not force_ocr and quality >= DOCLING_QUALITY_THRESHOLD:
-        logs.append(f"docling: suficiente (score={quality:.2f} >= {DOCLING_QUALITY_THRESHOLD}), parando chain")
-        return _make_result(filename, "pdf_native", method, pages, quality, text, logs=logs)
+    if quality >= PADDLE_OCR_QUALITY_THRESHOLD:
+        logs.append(f"paddleocr_vl: suficiente (score={quality:.2f} >= {PADDLE_OCR_QUALITY_THRESHOLD}), parando chain")
+        return _make_result(filename, "pdf_scanned", method, pages, quality, text, logs=logs)
 
-    # ------------------------------------------------------------------
-    # Step 3: MinerU
-    # ------------------------------------------------------------------
-    logs.append(f"mineru: tentando (score atual={quality:.2f})")
-    try:
-        import tempfile
-        import subprocess as _sp
-        with tempfile.TemporaryDirectory() as _tmpdir:
-            _out_dir = Path(_tmpdir) / "out"
-            _out_dir.mkdir()
-            _cmd = [
-                "mineru",
-                "-p", str(path),
-                "-o", str(_out_dir),
-                "--method", "auto",
-                "--lang", "en",
-            ]
-            import subprocess as _subprocess
-            _proc = _subprocess.Popen(
-                _cmd,
-                stdout=_subprocess.PIPE,
-                stderr=_subprocess.STDOUT,
-                text=True,
-            )
-            _stdout_lines: list = []
-            assert _proc.stdout is not None
-            for _line in _proc.stdout:
-                _line = _line.rstrip()
-                if _line:
-                    logs.append(f"mineru|stdout: {_line[:300]}")
-                    _stdout_lines.append(_line)
-            try:
-                _returncode = _proc.wait(timeout=300)
-            except _subprocess.TimeoutExpired:
-                _proc.kill()
-                raise RuntimeError("timeout após 300s")
-            if _returncode != 0:
-                _tail = "\n".join(_stdout_lines[-5:])
-                raise RuntimeError(f"returncode={_returncode}: {_tail[:400]}")
-            _md_files = list(_out_dir.rglob("*.md"))
-            _mineru_raw = "\n".join(f.read_text(errors="replace") for f in _md_files)
-
-        mineru_text = _normalize_text(_mineru_raw.strip())
-        if mineru_text:
-            mineru_pages = pages or 1
-            mineru_quality = _quality_score(mineru_text, mineru_pages)
-            logs.append(f"mineru: {len(mineru_text)} chars, {mineru_pages}p, score={mineru_quality:.2f}")
-            if mineru_quality > quality:
-                text = mineru_text
-                pages = mineru_pages
-                quality = mineru_quality
-                method = "mineru"
-        else:
-            logs.append("mineru: resultado vazio")
-    except FileNotFoundError:
-        logs.append("mineru: não instalado — pulado")
-    except Exception as e:
-        logs.append(f"mineru: falhou ({str(e)[:300]})")
-
-    if not force_ocr and quality >= MINERU_QUALITY_THRESHOLD:
-        logs.append(f"mineru: suficiente (score={quality:.2f} >= {MINERU_QUALITY_THRESHOLD}), parando chain")
-        type_detected = "pdf_native" if method in ("pymupdf", "docling", "mineru") else "pdf_scanned"
-        return _make_result(filename, type_detected, method, pages, quality, text, logs=logs)
-
-    # ------------------------------------------------------------------
-    # Step 4: Tesseract (último recurso)
-    # ------------------------------------------------------------------
     logs.append(f"tesseract: tentando (score atual={quality:.2f})")
     try:
-        text_ocr, pages_ocr, _ = _pdf_ocr_tesseract(path)
+        text_ocr, pages_ocr, _, failed_pages = _pdf_ocr_tesseract(path, review_dir=review_dir)
         ocr_text = _normalize_text(text_ocr)
         if ocr_text:
             ocr_pages = pages_ocr or max(1, pages)
@@ -1394,29 +1400,56 @@ def _parse_pdf(path: Path, use_easyocr: bool, force_ocr: bool) -> Dict:
                 method = "tesseract"
         else:
             logs.append("tesseract: resultado vazio")
+        if failed_pages:
+            logs.append(f"tesseract: páginas salvas para revisão manual={failed_pages}")
     except Exception as e:
         logs.append(f"tesseract: falhou ({e})")
 
-    type_detected = "pdf_native" if method in ("pymupdf", "docling", "mineru") else "pdf_scanned"
-    return _make_result(filename, type_detected, method or "failed", pages, quality, text, logs=logs)
+    if quality >= TESSERACT_QUALITY_THRESHOLD:
+        logs.append(f"tesseract: suficiente (score={quality:.2f} >= {TESSERACT_QUALITY_THRESHOLD}), parando chain")
+        return _make_result(filename, "pdf_scanned", method, pages, quality, text, logs=logs)
+
+    logs.append(f"review: falha final do chain para {filename}; páginas problemáticas em {review_dir}")
+    logger.error("parser_review_required file=%s job_id=%s review_dir=%s score=%.2f method=%s", filename, job_id, review_dir, quality, method or "failed")
+    return _make_result(
+        filename,
+        "pdf_scanned",
+        method or "failed",
+        pages,
+        quality,
+        text,
+        error=f"OCR abaixo do threshold mínimo; revisar páginas em {review_dir}",
+        logs=logs,
+    )
 
 
-def _pdf_ocr_tesseract(path: Path) -> tuple:
+def _pdf_ocr_tesseract(path: Path, review_dir: Optional[Path] = None) -> tuple:
     """Converte PDF para imagens e extrai texto via Tesseract."""
+    import fitz
     import pytesseract
     from PIL import Image
-    import fitz
+
+    review_dir = review_dir or REVIEW_ROOT / f"adhoc-{uuid.uuid4().hex}"
+    review_dir.mkdir(parents=True, exist_ok=True)
 
     doc = fitz.open(str(path))
-    images = []
-    for i in range(doc.page_count):
-        pix = doc.load_page(i).get_pixmap(dpi=200)
+    parts = []
+    failed_pages: List[int] = []
+    page_count = doc.page_count
+    for i in range(page_count):
+        page_number = i + 1
+        pix = doc.load_page(i).get_pixmap(dpi=200, alpha=False)
+        image_bytes = pix.tobytes("png")
         img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-        images.append(img)
+        page_text = _normalize_text(pytesseract.image_to_string(img, lang="por"))
+        if page_text:
+            parts.append(page_text)
+        else:
+            failed_pages.append(page_number)
+            (review_dir / f"page-{page_number:04d}.png").write_bytes(image_bytes)
     doc.close()
 
-    parts = [pytesseract.image_to_string(img, lang="por+eng") for img in images]
-    return "\n".join(parts).strip(), len(images), "tesseract"
+    return "\n".join(parts).strip(), page_count, "tesseract", failed_pages
 
 
 def _parse_docx(path: Path) -> Dict:
@@ -1449,7 +1482,7 @@ def _parse_image_ocr(path: Path) -> Dict:
         from PIL import Image
         import pytesseract
         img = Image.open(str(path))
-        text = pytesseract.image_to_string(img, lang="por+eng")
+        text = pytesseract.image_to_string(img, lang="por")
         return _make_result(filename, "image", "tesseract", 1, _quality_score(text, 1), text)
     except Exception as e:
         return _make_result(filename, "image", "failed", 0, 0.0, "", error=str(e))
